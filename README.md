@@ -175,9 +175,9 @@ explicit rather than hidden in a no-code step.
 
 ## Screenshots
 
-![Google Form](Form%20screenshot.png)
-
 ![Terminal Output](Terminal%20screenshot.png)
+
+![Google Form](Form%20screenshot.png)
 
 ![Responses Sheet](Sheets%20screenshot.png)
 
