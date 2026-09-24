@@ -172,3 +172,13 @@ between Google Forms, Gemini and HubSpot. This repository is that pipeline
 rewritten as a single Python script with direct API calls, which removed the
 dependency on paid Zapier features and made the error handling and validation
 explicit rather than hidden in a no-code step.
+
+## Screenshots
+
+![Google Form](Form screenshot.png)
+
+![Terminal Output](Terminal screenshot.png)
+
+![Responses Sheet](Sheets screenshot.png)
+
+![Deals Board](Deals screenshot.png)
