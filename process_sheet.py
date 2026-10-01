@@ -20,12 +20,7 @@ from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-from enrich_lead import (
-    associate_deal_with_contact,
-    create_deal,
-    enrich_with_gemini,
-    upsert_contact,
-)
+from enrich_lead import process_submission
 
 load_dotenv()
 
@@ -219,20 +214,19 @@ def main() -> int:
 
         print(f"Row {sheet_row_number} ({label}): processing...")
         try:
-            enrichment = enrich_with_gemini(submission["product_request"])
-            contact_id = upsert_contact(submission, enrichment)
-            deal_id = create_deal(submission, enrichment)
-            associate_deal_with_contact(deal_id, contact_id)
+            result = process_submission(submission)
         except Exception as error:
             # One bad submission should not stop the rest of the batch. The row
             # stays unmarked, so the next run retries it.
             print(f"  failed: {error}")
             continue
 
+        enrichment, deal_id = result["enrichment"], result["deal_id"]
         mark_processed(service, columns, sheet_row_number, f"deal:{deal_id}")
+        flags = ", ".join(enrichment["flags"]) or "none"
         print(
             f"  done. {enrichment['category']} / urgency "
-            f"{enrichment['urgency']} -> deal {deal_id}"
+            f"{enrichment['urgency']} -> deal {deal_id} (flags: {flags})"
         )
         processed_count += 1
 

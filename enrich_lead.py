@@ -5,8 +5,13 @@ Takes a raw wholesale inquiry (free-text product request plus contact details),
 uses Gemini to extract structured fields from the free text, then writes a
 contact and an associated deal into HubSpot.
 
+Every run is appended to data/runs.jsonl (input, prompt version, raw model
+output, validated fields, flags) so later corrections can be compared against
+exactly what the model said.
+
 Run:
     python enrich_lead.py sample_submission.json
+    python enrich_lead.py submissions/*.json                  # several at once
     python enrich_lead.py sample_submission.json --dry-run   # no API calls
 """
 
@@ -15,6 +20,8 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -31,13 +38,22 @@ GEMINI_URL = (
 )
 HUBSPOT_BASE = "https://api.hubapi.com"
 
-# Deal pipeline/stage the new deal lands in. "default" is the pipeline every
-# HubSpot account starts with; replace the stage id with your own if you have
-# renamed your stages (see README).
+# Deal pipeline/stage the new deal lands in. Renamed stages keep their original
+# internal ids, so "presentationscheduled" is what this account calls
+# "Stage 2: Rep Review Required". Every AI-enriched deal goes there so a person
+# checks it; those checks are the labels the evaluation is built on.
 DEAL_PIPELINE = "default"
-DEAL_STAGE = "appointmentscheduled"
+DEAL_STAGE = "presentationscheduled"
+
+# Bump this whenever the prompt changes, so accuracy can be compared per version.
+PROMPT_VERSION = "v1"
+
+RUN_LOG = Path(__file__).resolve().parent / "data" / "runs.jsonl"
 
 CATEGORIES = ["Cosmetics", "Electronics", "General", "Fashion", "Home"]
+
+# Requests shorter than this rarely carry enough detail to classify reliably.
+SHORT_REQUEST_WORDS = 6
 
 # HubSpot internal property names for the three enriched fields.
 #
@@ -55,6 +71,8 @@ DEAL_PROPERTIES = {
     "summary": "order_summary",
     "category": "product_category",
     "urgency": "urgency_tier",
+    "flags": "ai_flags",
+    "prompt_version": "ai_prompt_version",
 }
 
 PROMPT_TEMPLATE = """You are a Sales Operations Assistant for a wholesale distributor.
@@ -87,28 +105,63 @@ def strip_code_fences(text: str) -> str:
     return cleaned.replace("```", "").strip()
 
 
-def validate_enrichment(data: dict) -> dict:
+def validate_enrichment(data: dict, product_request: str = "") -> dict:
     """Coerce the model's output into something safe to write to a CRM.
 
     An LLM will occasionally return urgency as "2" or "high", or invent a
     category outside the allowed list. Writing that straight into HubSpot gives
     you dirty data that is painful to clean up later, so it is normalised here.
+
+    Every time a value has to be repaired or looks doubtful, a flag is recorded.
+    A silent fallback would make a wrong answer look like a confident one, and
+    the reviewer (and the evaluation) would never know.
     """
+    flags = []
+
     summary = str(data.get("summary", "")).strip()
+    if not summary:
+        flags.append("empty_summary")
 
     raw_urgency = str(data.get("urgency", "")).strip()
     urgency_match = re.search(r"[123]", raw_urgency)
-    urgency = urgency_match.group(0) if urgency_match else "2"
+    if urgency_match:
+        urgency = urgency_match.group(0)
+        if raw_urgency != urgency:
+            flags.append(f"urgency_coerced:{raw_urgency}")
+    else:
+        urgency = "2"
+        flags.append(f"urgency_fallback:{raw_urgency or 'missing'}")
 
-    category = str(data.get("category", "")).strip()
-    match = next((c for c in CATEGORIES if c.lower() == category.lower()), None)
-    category = match or "General"
+    raw_category = str(data.get("category", "")).strip()
+    match = next(
+        (c for c in CATEGORIES if c.lower() == raw_category.lower()), None
+    )
+    if match is None:
+        category = "General"
+        flags.append(f"category_fallback:{raw_category or 'missing'}")
+    else:
+        category = match
+        if category == "General":
+            # The model choosing the catch-all usually means it was unsure.
+            flags.append("general_category")
 
-    return {"summary": summary, "urgency": urgency, "category": category}
+    if len(product_request.split()) < SHORT_REQUEST_WORDS:
+        flags.append("short_request")
+
+    return {
+        "summary": summary,
+        "urgency": urgency,
+        "category": category,
+        "flags": flags,
+    }
 
 
 def enrich_with_gemini(product_request: str) -> dict:
-    """Send the free-text request to Gemini and return validated fields."""
+    """Send the free-text request to Gemini and return validated fields.
+
+    The raw model text is kept alongside the validated fields so the run log
+    shows what the model actually said, not just what survived validation.
+    """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set. See .env.example.")
 
@@ -132,7 +185,10 @@ def enrich_with_gemini(product_request: str) -> dict:
 
     raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
     parsed = json.loads(strip_code_fences(raw_text))
-    return validate_enrichment(parsed)
+    enrichment = validate_enrichment(parsed, product_request)
+    enrichment["raw_output"] = raw_text
+    enrichment["prompt_version"] = PROMPT_VERSION
+    return enrichment
 
 
 def hubspot_headers() -> dict:
@@ -247,10 +303,14 @@ def create_deal(submission: dict, enrichment: dict) -> str:
                 "dealname": f"{submission['company_name']} - Wholesale Order",
                 "pipeline": DEAL_PIPELINE,
                 "dealstage": DEAL_STAGE,
-                "description": enrichment["summary"],
+                # The buyer's own words, so the reviewer can judge the AI fields
+                # against the source. The AI summary lives in order_summary.
+                "description": submission["product_request"],
                 DEAL_PROPERTIES["summary"]: enrichment["summary"],
                 DEAL_PROPERTIES["category"]: enrichment["category"],
                 DEAL_PROPERTIES["urgency"]: enrichment["urgency"],
+                DEAL_PROPERTIES["flags"]: ", ".join(enrichment["flags"]),
+                DEAL_PROPERTIES["prompt_version"]: enrichment["prompt_version"],
             }
         },
         timeout=30,
@@ -267,6 +327,48 @@ def associate_deal_with_contact(deal_id: str, contact_id: str) -> None:
         timeout=30,
     )
     check(response, "deal-contact association")
+
+
+def log_run(submission: dict, enrichment: dict, deal_id: str, contact_id: str):
+    """Append one line per processed submission to the run log.
+
+    The deal id is the join key: when a reviewer later edits the deal in
+    HubSpot, this line is the record of what the model originally said.
+    Contact names and emails are left out; they are not needed to learn from.
+    """
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "deal_id": deal_id,
+        "contact_id": contact_id,
+        "model": GEMINI_MODEL,
+        "prompt_version": enrichment["prompt_version"],
+        "company_name": submission["company_name"],
+        "product_request": submission["product_request"],
+        "raw_output": enrichment["raw_output"],
+        "output": {
+            "summary": enrichment["summary"],
+            "urgency": enrichment["urgency"],
+            "category": enrichment["category"],
+        },
+        "flags": enrichment["flags"],
+    }
+    RUN_LOG.parent.mkdir(exist_ok=True)
+    with open(RUN_LOG, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def process_submission(submission: dict) -> dict:
+    """Enrich one submission, write it to HubSpot and log the run.
+
+    Shared by both entry points so the form path and the file path cannot
+    drift apart.
+    """
+    enrichment = enrich_with_gemini(submission["product_request"])
+    contact_id = upsert_contact(submission, enrichment)
+    deal_id = create_deal(submission, enrichment)
+    associate_deal_with_contact(deal_id, contact_id)
+    log_run(submission, enrichment, deal_id, contact_id)
+    return {"enrichment": enrichment, "deal_id": deal_id, "contact_id": contact_id}
 
 
 def load_submission(path: str) -> dict:
@@ -288,7 +390,9 @@ def load_submission(path: str) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("submission", help="Path to a submission JSON file")
+    parser.add_argument(
+        "submissions", nargs="+", help="Path(s) to submission JSON files"
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -296,32 +400,38 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    submission = load_submission(args.submission)
-    print(f"Processing inquiry from {submission['company_name']}...\n")
+    failures = 0
+    for path in args.submissions:
+        submission = load_submission(path)
+        print(f"Processing inquiry from {submission['company_name']} ({path})...")
 
-    if args.dry_run:
-        print("DRY RUN - no API calls made.\n")
-        print("Prompt that would be sent to Gemini:")
-        print("-" * 60)
-        print(build_prompt(submission["product_request"]))
-        print("-" * 60)
-        return 0
+        if args.dry_run:
+            print("DRY RUN - no API calls made.\n")
+            print("Prompt that would be sent to Gemini:")
+            print("-" * 60)
+            print(build_prompt(submission["product_request"]))
+            print("-" * 60 + "\n")
+            continue
 
-    enrichment = enrich_with_gemini(submission["product_request"])
-    print("Gemini returned:")
-    print(json.dumps(enrichment, indent=2))
-    print()
+        try:
+            result = process_submission(submission)
+        except Exception as error:
+            # Same rule as the sheet path: one bad submission does not stop
+            # the batch.
+            print(f"  failed: {error}\n")
+            failures += 1
+            continue
 
-    contact_id = upsert_contact(submission, enrichment)
-    print(f"Contact upserted: {contact_id}")
+        enrichment = result["enrichment"]
+        flags = ", ".join(enrichment["flags"]) or "none"
+        print(
+            f"  {enrichment['category']} / urgency {enrichment['urgency']} "
+            f"-> deal {result['deal_id']} (flags: {flags})\n"
+        )
 
-    deal_id = create_deal(submission, enrichment)
-    print(f"Deal created:     {deal_id}")
-
-    associate_deal_with_contact(deal_id, contact_id)
-    print(f"Deal {deal_id} associated with contact {contact_id}")
-    print("\nDone. Check your HubSpot deal board.")
-    return 0
+    if not args.dry_run:
+        print(f"Done. Runs logged to {RUN_LOG}")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
