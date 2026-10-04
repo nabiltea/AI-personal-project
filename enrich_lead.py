@@ -44,6 +44,9 @@ HUBSPOT_BASE = "https://api.hubapi.com"
 # submission.
 GEMINI_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_SECONDS = 30
+# A per-minute limit asks for a wait of under a minute. A much longer wait
+# means the daily quota is used up, and sleeping for hours helps nobody.
+MAX_RETRY_WAIT_SECONDS = 120
 
 # Deal pipeline/stage the new deal lands in. Renamed stages keep their original
 # internal ids, so "presentationscheduled" is what this account calls
@@ -207,6 +210,11 @@ def enrich_with_gemini(product_request: str) -> dict:
         if response.status_code != 429 or attempt == GEMINI_MAX_ATTEMPTS:
             break
         wait = retry_delay_seconds(response)
+        if wait > MAX_RETRY_WAIT_SECONDS:
+            raise RuntimeError(
+                f"Gemini daily quota used up; it resets in about "
+                f"{wait / 3600:.1f} hours."
+            )
         print(f"  Gemini rate limit hit, waiting {wait}s (attempt {attempt})...")
         time.sleep(wait)
     response.raise_for_status()
