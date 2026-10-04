@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +38,12 @@ GEMINI_URL = (
     f"{GEMINI_MODEL}:generateContent"
 )
 HUBSPOT_BASE = "https://api.hubapi.com"
+
+# The Gemini free tier allows only a few requests per minute. When it says
+# "too many requests" (429), wait and try again rather than failing the
+# submission.
+GEMINI_MAX_ATTEMPTS = 5
+DEFAULT_RETRY_SECONDS = 30
 
 # Deal pipeline/stage the new deal lands in. Renamed stages keep their original
 # internal ids, so "presentationscheduled" is what this account calls
@@ -156,6 +163,21 @@ def validate_enrichment(data: dict, product_request: str = "") -> dict:
     }
 
 
+def retry_delay_seconds(response: requests.Response) -> int:
+    """How long Gemini asks us to wait after a 429, e.g. "37s" -> 37.
+
+    The error body usually carries a RetryInfo entry with the exact delay.
+    If it is missing or unreadable, fall back to a safe default.
+    """
+    try:
+        for detail in response.json()["error"]["details"]:
+            if "retryDelay" in detail:
+                return int(float(detail["retryDelay"].rstrip("s"))) + 1
+    except (ValueError, KeyError, TypeError):
+        pass
+    return DEFAULT_RETRY_SECONDS
+
+
 def enrich_with_gemini(product_request: str) -> dict:
     """Send the free-text request to Gemini and return validated fields.
 
@@ -165,22 +187,28 @@ def enrich_with_gemini(product_request: str) -> dict:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set. See .env.example.")
 
-    response = requests.post(
-        GEMINI_URL,
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY,
-        },
-        json={
-            "contents": [
-                {"parts": [{"text": build_prompt(product_request)}]}
-            ],
-            # temperature 0 keeps classifications stable across identical
-            # submissions, which matters more here than variety.
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 1024},
-        },
-        timeout=30,
-    )
+    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        response = requests.post(
+            GEMINI_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": GEMINI_API_KEY,
+            },
+            json={
+                "contents": [
+                    {"parts": [{"text": build_prompt(product_request)}]}
+                ],
+                # temperature 0 keeps classifications stable across identical
+                # submissions, which matters more here than variety.
+                "generationConfig": {"temperature": 0, "maxOutputTokens": 1024},
+            },
+            timeout=30,
+        )
+        if response.status_code != 429 or attempt == GEMINI_MAX_ATTEMPTS:
+            break
+        wait = retry_delay_seconds(response)
+        print(f"  Gemini rate limit hit, waiting {wait}s (attempt {attempt})...")
+        time.sleep(wait)
     response.raise_for_status()
 
     raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
