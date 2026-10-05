@@ -57,6 +57,8 @@ DEAL_STAGE = "presentationscheduled"
 
 # Bump this whenever the prompt changes, so accuracy can be compared per version.
 PROMPT_VERSION = "v1"
+# v1 plus similar past reviewed requests as examples (see examples.py).
+FEWSHOT_PROMPT_VERSION = "v2"
 
 RUN_LOG = Path(__file__).resolve().parent / "data" / "runs.jsonl"
 
@@ -98,11 +100,24 @@ additional text, markdown, or formatting:
   "category": "Pick the single best fit from this exact list: {categories}"}}"""
 
 
-def build_prompt(product_request: str) -> str:
-    return PROMPT_TEMPLATE.format(
+REQUEST_HEADING = "Here is the request from the buyer:"
+
+
+def build_prompt(product_request: str, examples_block: str = "") -> str:
+    """Fill in the prompt template, optionally with past examples.
+
+    Examples go just before the buyer's request. Without examples the prompt
+    is exactly the v1 prompt, so v1 results stay comparable.
+    """
+    prompt = PROMPT_TEMPLATE.format(
         product_request=product_request,
         categories="[" + ", ".join(CATEGORIES) + "]",
     )
+    if examples_block:
+        prompt = prompt.replace(
+            REQUEST_HEADING, f"{examples_block}\n\n{REQUEST_HEADING}", 1
+        )
+    return prompt
 
 
 def strip_code_fences(text: str) -> str:
@@ -166,6 +181,10 @@ def validate_enrichment(data: dict, product_request: str = "") -> dict:
     }
 
 
+class QuotaExhausted(RuntimeError):
+    """Gemini's daily free quota is used up. Retrying today will not help."""
+
+
 def retry_delay_seconds(response: requests.Response) -> int:
     """How long Gemini asks us to wait after a 429, e.g. "37s" -> 37.
 
@@ -181,11 +200,12 @@ def retry_delay_seconds(response: requests.Response) -> int:
     return DEFAULT_RETRY_SECONDS
 
 
-def enrich_with_gemini(product_request: str) -> dict:
+def enrich_with_gemini(product_request: str, examples_block: str = "") -> dict:
     """Send the free-text request to Gemini and return validated fields.
 
     The raw model text is kept alongside the validated fields so the run log
     shows what the model actually said, not just what survived validation.
+    Passing an examples_block switches to the few-shot prompt (v2).
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set. See .env.example.")
@@ -199,11 +219,14 @@ def enrich_with_gemini(product_request: str) -> dict:
             },
             json={
                 "contents": [
-                    {"parts": [{"text": build_prompt(product_request)}]}
+                    {"parts": [{"text": build_prompt(product_request, examples_block)}]}
                 ],
                 # temperature 0 keeps classifications stable across identical
                 # submissions, which matters more here than variety.
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 1024},
+                # gemini-2.5-flash "thinks" before answering and that thinking
+                # counts towards maxOutputTokens; at 1024 a long request could
+                # cut the JSON off halfway, so leave plenty of room.
+                "generationConfig": {"temperature": 0, "maxOutputTokens": 4096},
             },
             timeout=30,
         )
@@ -211,7 +234,7 @@ def enrich_with_gemini(product_request: str) -> dict:
             break
         wait = retry_delay_seconds(response)
         if wait > MAX_RETRY_WAIT_SECONDS:
-            raise RuntimeError(
+            raise QuotaExhausted(
                 f"Gemini daily quota used up; it resets in about "
                 f"{wait / 3600:.1f} hours."
             )
@@ -219,11 +242,20 @@ def enrich_with_gemini(product_request: str) -> dict:
         time.sleep(wait)
     response.raise_for_status()
 
-    raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-    parsed = json.loads(strip_code_fences(raw_text))
+    candidate = response.json()["candidates"][0]
+    if candidate.get("finishReason") == "MAX_TOKENS":
+        raise RuntimeError("Gemini's reply was cut off by the output token limit.")
+    raw_text = candidate["content"]["parts"][0]["text"]
+    try:
+        parsed = json.loads(strip_code_fences(raw_text))
+    except ValueError:
+        # Show what came back; a bare JSON error hides the actual cause.
+        raise RuntimeError(f"Gemini did not return valid JSON: {raw_text[:300]!r}")
     enrichment = validate_enrichment(parsed, product_request)
     enrichment["raw_output"] = raw_text
-    enrichment["prompt_version"] = PROMPT_VERSION
+    enrichment["prompt_version"] = (
+        FEWSHOT_PROMPT_VERSION if examples_block else PROMPT_VERSION
+    )
     return enrichment
 
 
