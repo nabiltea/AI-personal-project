@@ -1,0 +1,62 @@
+[
+  {
+    "id": "t01",
+    "product_request": "We need 80 electric toothbrushes for our pharmacy, delivered within 10 days.",
+    "category": "Electronics",
+    "urgency": "2"
+  },
+  {
+    "id": "t02",
+    "product_request": "Looking for 200 Christmas jumpers, they need to be in our shops by mid-November.",
+    "category": "Fashion",
+    "urgency": "1"
+  },
+  {
+    "id": "t03",
+    "product_request": "Can you get us 50 kettles and 50 toasters by this Friday? New office kitchen.",
+    "category": "Home",
+    "urgency": "3"
+  },
+  {
+    "id": "t04",
+    "product_request": "We'd like around 300 nail polishes in roughly three weeks.",
+    "category": "Cosmetics",
+    "urgency": "2"
+  },
+  {
+    "id": "t05",
+    "product_request": "Restocking for Black Friday: 150 wireless earbuds please.",
+    "category": "Electronics",
+    "urgency": "1"
+  },
+  {
+    "id": "t06",
+    "product_request": "Need 40 duvets urgently, a pipe burst at our guesthouse and the rooms are booked.",
+    "category": "Home",
+    "urgency": "3"
+  },
+  {
+    "id": "t07",
+    "product_request": "Planning our spring 2027 collection: 500 linen shirts, no rush at all.",
+    "category": "Fashion",
+    "urgency": "1"
+  },
+  {
+    "id": "t08",
+    "product_request": "Please quote for 60 bluetooth speakers and 20 phone chargers, needed sometime within the month.",
+    "category": "Electronics",
+    "urgency": "2"
+  },
+  {
+    "id": "t09",
+    "product_request": "We need 100 sheet masks and 100 serums before our pop-up shop opens on the 20th.",
+    "category": "Cosmetics",
+    "urgency": "2"
+  },
+  {
+    "id": "t10",
+    "product_request": "We want 25 yoga blocks.",
+    "category": "General",
+    "urgency": "2"
+  }
+]
