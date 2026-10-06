@@ -21,7 +21,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import requests
@@ -56,9 +56,11 @@ DEAL_PIPELINE = "default"
 DEAL_STAGE = "presentationscheduled"
 
 # Bump this whenever the prompt changes, so accuracy can be compared per version.
+#   v1  original prompt
+#   v2  v1 + similar past reviewed requests as examples (see examples.py)
+#   v3  v1 + the date the request came in + the written urgency rules
+#   v4  v3 + similar past reviewed requests, showing urgency only
 PROMPT_VERSION = "v1"
-# v1 plus similar past reviewed requests as examples (see examples.py).
-FEWSHOT_PROMPT_VERSION = "v2"
 
 RUN_LOG = Path(__file__).resolve().parent / "data" / "runs.jsonl"
 
@@ -100,18 +102,62 @@ additional text, markdown, or formatting:
   "category": "Pick the single best fit from this exact list: {categories}"}}"""
 
 
+# v3: the model cannot know what day it is, so "by mid-November" means nothing
+# to it unless it is told when the request came in. The thresholds are the
+# ones in LABELLING.md, written before the test set existed.
+PROMPT_TEMPLATE_V3 = """You are a Sales Operations Assistant for a wholesale distributor.
+Your job is to analyse inbound wholesale buyer requests and extract specific data.
+
+The request was received on {received}. Urgency is how soon the buyer needs
+the goods, counted from that date:
+- 3: needed within a week (e.g. "ASAP", "by Friday", "reopens in 3 days")
+- 2: needed in one week to one month (e.g. "within two weeks", "sometime this
+  month"), or no deadline mentioned
+- 1: needed more than a month away (e.g. "next quarter", "for next season")
+If the request gives conflicting signals, choose the higher urgency.
+
+Here is the request from the buyer:
+{product_request}
+
+Extract the following and return it strictly as a clean JSON object with no
+additional text, markdown, or formatting:
+{{"summary": "Write a 1-sentence summary of the products requested",
+  "urgency": "Assign an urgency tier of exactly 1, 2, or 3 following the rules above",
+  "category": "Pick the single best fit from this exact list: {categories}"}}"""
+
 REQUEST_HEADING = "Here is the request from the buyer:"
 
 
-def build_prompt(product_request: str, examples_block: str = "") -> str:
-    """Fill in the prompt template, optionally with past examples.
+def format_received(day: date) -> str:
+    """The date a request came in, as the prompt states it: "Monday 5 October 2026".
 
-    Examples go just before the buyer's request. Without examples the prompt
-    is exactly the v1 prompt, so v1 results stay comparable.
+    In production this is the form submission's timestamp; in the test set it
+    is stored with each case, so evaluations give the same result whenever
+    they are run.
     """
-    prompt = PROMPT_TEMPLATE.format(
+    return f"{day:%A} {day.day} {day:%B %Y}"
+
+
+def prompt_version(examples_block: str = "", received: str = None) -> str:
+    if received:
+        return "v4" if examples_block else "v3"
+    return "v2" if examples_block else "v1"
+
+
+def build_prompt(
+    product_request: str, examples_block: str = "", received: str = None
+) -> str:
+    """Fill in the prompt template, optionally with a date and past examples.
+
+    received (e.g. "Monday 5 October 2026") switches to the v3 template with
+    the urgency rules. Examples go just before the buyer's request. With
+    neither, the prompt is exactly v1, so v1 results stay comparable.
+    """
+    template = PROMPT_TEMPLATE_V3 if received else PROMPT_TEMPLATE
+    prompt = template.format(
         product_request=product_request,
         categories="[" + ", ".join(CATEGORIES) + "]",
+        received=received,
     )
     if examples_block:
         prompt = prompt.replace(
@@ -200,12 +246,14 @@ def retry_delay_seconds(response: requests.Response) -> int:
     return DEFAULT_RETRY_SECONDS
 
 
-def enrich_with_gemini(product_request: str, examples_block: str = "") -> dict:
+def enrich_with_gemini(
+    product_request: str, examples_block: str = "", received: str = None
+) -> dict:
     """Send the free-text request to Gemini and return validated fields.
 
     The raw model text is kept alongside the validated fields so the run log
     shows what the model actually said, not just what survived validation.
-    Passing an examples_block switches to the few-shot prompt (v2).
+    examples_block and received select the prompt version (see build_prompt).
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set. See .env.example.")
@@ -219,7 +267,11 @@ def enrich_with_gemini(product_request: str, examples_block: str = "") -> dict:
             },
             json={
                 "contents": [
-                    {"parts": [{"text": build_prompt(product_request, examples_block)}]}
+                    {
+                        "parts": [
+                            {"text": build_prompt(product_request, examples_block, received)}
+                        ]
+                    }
                 ],
                 # temperature 0 keeps classifications stable across identical
                 # submissions, which matters more here than variety.
@@ -253,9 +305,7 @@ def enrich_with_gemini(product_request: str, examples_block: str = "") -> dict:
         raise RuntimeError(f"Gemini did not return valid JSON: {raw_text[:300]!r}")
     enrichment = validate_enrichment(parsed, product_request)
     enrichment["raw_output"] = raw_text
-    enrichment["prompt_version"] = (
-        FEWSHOT_PROMPT_VERSION if examples_block else PROMPT_VERSION
-    )
+    enrichment["prompt_version"] = prompt_version(examples_block, received)
     return enrichment
 
 

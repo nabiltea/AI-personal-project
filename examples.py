@@ -15,6 +15,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 EXAMPLES_PER_REQUEST = 3
 
+ALL_FIELDS = ("category", "urgency")
+
 
 def load_pool(path) -> list:
     with open(path, encoding="utf-8") as handle:
@@ -43,22 +45,38 @@ def find_similar(product_request: str, pool: list, k: int = EXAMPLES_PER_REQUEST
     return [pool[i] for i in ranked[:k]]
 
 
-def format_examples(examples: list) -> str:
+def format_examples(examples: list, fields: tuple = ALL_FIELDS) -> str:
     """Render examples for the prompt, showing the AI's first answer and the
-    rep's verdict, so the model can see which way its mistakes tend to go."""
-    lines = [
-        "Here are similar past requests. For each, you can see the AI's first "
-        "answer and the sales rep's final verdict. Follow the rep's judgement."
-    ]
+    rep's verdict, so the model can see which way its mistakes tend to go.
+
+    fields limits what the examples show. With ("urgency",) the model never
+    sees past categories, so it cannot copy one from a request that merely
+    shares a word with the new one (as "yoga mats" -> Fashion did for
+    "yoga blocks"). The reviewed deals held no category corrections, so the
+    examples had nothing to teach about category anyway.
+    """
+    if fields == ALL_FIELDS:
+        intro = (
+            "Here are similar past requests. For each, you can see the AI's "
+            "first answer and the sales rep's final verdict. Follow the rep's "
+            "judgement."
+        )
+    else:
+        intro = (
+            f"Here are similar past requests. For each, you can see the "
+            f"{' and '.join(fields)} the AI first gave and the sales rep's final "
+            f"verdict. Use them only to judge {' and '.join(fields)}."
+        )
+
+    def describe(answer):
+        return ", ".join(f"{f} {answer[f]}" for f in fields)
+
+    lines = [intro]
     for example in examples:
-        ai, human = example["ai"], example["human"]
         lines.append(f'\nRequest: "{example["product_request"]}"')
-        lines.append(f"AI answered: category {ai['category']}, urgency {ai['urgency']}")
-        if example["corrected_fields"]:
-            lines.append(
-                f"Rep corrected it to: category {human['category']}, "
-                f"urgency {human['urgency']}"
-            )
+        lines.append(f"AI answered: {describe(example['ai'])}")
+        if any(f in example["corrected_fields"] for f in fields):
+            lines.append(f"Rep corrected it to: {describe(example['human'])}")
         else:
             lines.append("Rep confirmed this was correct.")
     return "\n".join(lines)

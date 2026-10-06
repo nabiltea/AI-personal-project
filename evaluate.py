@@ -2,9 +2,11 @@
 Score the classifier against the hand-labelled test set (data/test_set.json).
 
 Run:
-    python evaluate.py --mode baseline             # prompt v1, no examples
-    python evaluate.py --mode fewshot              # prompt v2, with similar past reviews
-    python evaluate.py --mode fewshot --dry-run    # print the prompts, no API calls
+    python evaluate.py --mode baseline             # v1: original prompt
+    python evaluate.py --mode fewshot              # v2: v1 + similar past reviews
+    python evaluate.py --mode rules                # v3: v1 + date + urgency rules
+    python evaluate.py --mode rules-fewshot        # v4: v3 + past reviews, urgency only
+    python evaluate.py --mode rules --dry-run      # print the prompts, no API calls
     python evaluate.py --report                    # compare everything scored so far
 
 Each answer is saved to data/eval_results.jsonl the moment it comes back, and a
@@ -15,24 +17,42 @@ requests a day) a crash halfway must not throw away answers already paid for.
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from capture_corrections import CORRECTIONS_FILE, SCORED_FIELDS
-from enrich_lead import QuotaExhausted, build_prompt, enrich_with_gemini
-from examples import find_similar, format_examples, load_pool
+from enrich_lead import (
+    QuotaExhausted,
+    build_prompt,
+    enrich_with_gemini,
+    format_received,
+)
+from examples import ALL_FIELDS, find_similar, format_examples, load_pool
 
 DATA = Path(__file__).resolve().parent / "data"
 TEST_SET = DATA / "test_set.json"
 RESULTS = DATA / "eval_results.jsonl"
 
+# Each test case stores the date it "came in" (its labels are correct relative
+# to that date), so the result is the same whenever the evaluation is run.
+MODES = {
+    # mode:          (tell the date?, use examples?, fields shown in examples)
+    "baseline":      (False, False, None),
+    "fewshot":       (False, True, ALL_FIELDS),
+    "rules":         (True, False, None),
+    "rules-fewshot": (True, True, ("urgency",)),
+}
+
 
 def load_test_set() -> list:
     with open(TEST_SET, encoding="utf-8") as handle:
         cases = json.load(handle)
-    unlabelled = [c["id"] for c in cases if not all(c[f] for f in SCORED_FIELDS)]
-    if unlabelled:
-        raise RuntimeError(f"These test cases have no labels yet: {unlabelled}")
+    required = list(SCORED_FIELDS) + ["received"]
+    incomplete = [c["id"] for c in cases if not all(c.get(f) for f in required)]
+    if incomplete:
+        raise RuntimeError(
+            f"These test cases are missing a label or received date: {incomplete}"
+        )
     return cases
 
 
@@ -64,12 +84,14 @@ def save_result(record: dict) -> None:
 
 def score(mode: str, pool_path: Path, dry_run: bool) -> None:
     cases = load_test_set()
-    pool = load_pool(pool_path) if mode == "fewshot" else []
+    tell_date, use_examples, example_fields = MODES[mode]
+    pool = load_pool(pool_path) if use_examples else []
     check_no_leak(cases, pool)
 
-    # The run name ties results together: "baseline", or "fewshot:<pool file>"
-    # so that a later run with a different pool is kept separate.
-    run = "baseline" if mode == "baseline" else f"fewshot:{pool_path.name}"
+    # The run name ties results together, e.g. "baseline" or
+    # "fewshot:corrections.jsonl", so a later run with a different example pool
+    # is kept separate.
+    run = f"{mode}:{pool_path.name}" if use_examples else mode
     done = {r["case_id"] for r in load_results() if r["run"] == run}
 
     for case in cases:
@@ -77,16 +99,19 @@ def score(mode: str, pool_path: Path, dry_run: bool) -> None:
             continue
 
         examples = find_similar(case["product_request"], pool) if pool else []
-        block = format_examples(examples) if examples else ""
+        block = format_examples(examples, example_fields) if examples else ""
+        received = (
+            format_received(date.fromisoformat(case["received"])) if tell_date else None
+        )
 
         if dry_run:
             print(f"===== {case['id']} =====")
-            print(build_prompt(case["product_request"], block), "\n")
+            print(build_prompt(case["product_request"], block, received), "\n")
             continue
 
         expected = {f: case[f] for f in SCORED_FIELDS}
         try:
-            answer = enrich_with_gemini(case["product_request"], block)
+            answer = enrich_with_gemini(case["product_request"], block, received)
             predicted = {f: answer[f] for f in SCORED_FIELDS}
             prompt_version, error = answer["prompt_version"], None
         except QuotaExhausted as stop:
@@ -156,7 +181,7 @@ def report() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["baseline", "fewshot"])
+    parser.add_argument("--mode", choices=list(MODES))
     parser.add_argument(
         "--pool",
         type=Path,
