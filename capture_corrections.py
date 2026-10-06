@@ -17,6 +17,7 @@ import sys
 import requests
 
 from enrich_lead import (
+    CORRECTIONS_FILE,
     DEAL_PROPERTIES,
     DEAL_STAGE as REVIEW_STAGE,
     HUBSPOT_BASE,
@@ -24,8 +25,6 @@ from enrich_lead import (
     check,
     hubspot_headers,
 )
-
-CORRECTIONS_FILE = RUN_LOG.parent / "corrections.jsonl"
 
 # The two fields the reviewer judges. The summary is free text, so there is no
 # single right answer to compare it against.

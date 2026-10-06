@@ -20,14 +20,17 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from capture_corrections import CORRECTIONS_FILE, SCORED_FIELDS
+from capture_corrections import SCORED_FIELDS
 from enrich_lead import (
+    CORRECTIONS_FILE,
+    LIVE_MODE,
+    PROMPT_MODES,
     QuotaExhausted,
     build_prompt,
     enrich_with_gemini,
     format_received,
 )
-from examples import ALL_FIELDS, find_similar, format_examples, load_pool
+from examples import find_similar, format_examples, load_pool
 
 DATA = Path(__file__).resolve().parent / "data"
 TEST_SET = DATA / "test_set.json"
@@ -35,13 +38,6 @@ RESULTS = DATA / "eval_results.jsonl"
 
 # Each test case stores the date it "came in" (its labels are correct relative
 # to that date), so the result is the same whenever the evaluation is run.
-MODES = {
-    # mode:          (tell the date?, use examples?, fields shown in examples)
-    "baseline":      (False, False, None),
-    "fewshot":       (False, True, ALL_FIELDS),
-    "rules":         (True, False, None),
-    "rules-fewshot": (True, True, ("urgency",)),
-}
 
 
 def load_test_set() -> list:
@@ -84,7 +80,7 @@ def save_result(record: dict) -> None:
 
 def score(mode: str, pool_path: Path, dry_run: bool) -> None:
     cases = load_test_set()
-    tell_date, use_examples, example_fields = MODES[mode]
+    tell_date, use_examples, example_fields = PROMPT_MODES[mode]
     pool = load_pool(pool_path) if use_examples else []
     check_no_leak(cases, pool)
 
@@ -143,6 +139,46 @@ def score(mode: str, pool_path: Path, dry_run: bool) -> None:
         print(f"{case['id']}: {predicted} expected {expected} -> {verdict}")
 
 
+def resolve_run(name: str, runs: list) -> str:
+    """Accept a full run name ("rules-fewshot:corrections.jsonl") or a mode."""
+    if name in runs:
+        return name
+    matches = [run for run in runs if run.split(":")[0] == name]
+    if len(matches) != 1:
+        raise RuntimeError(f"No single saved run matches '{name}'. Saved: {runs}")
+    return matches[0]
+
+
+def gate(candidate: str, current: str) -> bool:
+    """Decide whether the candidate may replace the current version.
+
+    Rule: promote if the candidate gets at least as many test cases fully
+    right (category and urgency) as the current version. A version that
+    trades one category for three urgencies still counts as better overall.
+    """
+    cases = load_test_set()
+    results = load_results()
+    runs = list(dict.fromkeys(r["run"] for r in results))
+    candidate, current = resolve_run(candidate, runs), resolve_run(current, runs)
+    latest = {(r["run"], r["case_id"]): r for r in results}
+
+    scores = {}
+    for run in (candidate, current):
+        missing = [c["id"] for c in cases if (run, c["id"]) not in latest]
+        if missing:
+            raise RuntimeError(f"'{run}' has not been scored on {missing} yet.")
+        scores[run] = sum(all(latest[(run, c["id"])]["correct"].values()) for c in cases)
+
+    promote = scores[candidate] >= scores[current]
+    n = len(cases)
+    print(
+        f"candidate {candidate}: {scores[candidate]}/{n} fully right\n"
+        f"current   {current}: {scores[current]}/{n} fully right\n"
+        f"-> {'PROMOTE' if promote else 'REJECT'}"
+    )
+    return promote
+
+
 def report() -> None:
     """Print every case against every run, then accuracy per run."""
     cases = load_test_set()
@@ -181,7 +217,7 @@ def report() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=list(MODES))
+    parser.add_argument("--mode", choices=list(PROMPT_MODES))
     parser.add_argument(
         "--pool",
         type=Path,
@@ -190,13 +226,26 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="Print prompts only")
     parser.add_argument("--report", action="store_true", help="Compare saved runs")
+    parser.add_argument(
+        "--gate",
+        metavar="CANDIDATE",
+        help="Decide whether CANDIDATE may replace the --against run",
+    )
+    parser.add_argument(
+        "--against",
+        default=LIVE_MODE,
+        help=f"Run the candidate must beat (default: the live one, {LIVE_MODE})",
+    )
     args = parser.parse_args()
 
     if args.mode:
         score(args.mode, args.pool, args.dry_run)
     if args.report or (args.mode and not args.dry_run):
         report()
-    if not args.mode and not args.report:
+    if args.gate:
+        # Exit code 0 = promote, 1 = reject, so scripts can act on it.
+        return 0 if gate(args.gate, args.against) else 1
+    if not (args.mode or args.report):
         parser.print_help()
     return 0
 

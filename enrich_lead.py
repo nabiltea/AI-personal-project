@@ -27,6 +27,8 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from examples import ALL_FIELDS, find_similar, format_examples, load_pool
+
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -55,14 +57,31 @@ MAX_RETRY_WAIT_SECONDS = 120
 DEAL_PIPELINE = "default"
 DEAL_STAGE = "presentationscheduled"
 
-# Bump this whenever the prompt changes, so accuracy can be compared per version.
+# Prompt versions, recorded on every run and deal so accuracy can be compared
+# per version (see prompt_version()). Add a new one whenever the prompt changes.
 #   v1  original prompt
 #   v2  v1 + similar past reviewed requests as examples (see examples.py)
 #   v3  v1 + the date the request came in + the written urgency rules
 #   v4  v3 + similar past reviewed requests, showing urgency only
-PROMPT_VERSION = "v1"
 
 RUN_LOG = Path(__file__).resolve().parent / "data" / "runs.jsonl"
+# Every deal a rep has reviewed; the example pool for v2 and v4.
+CORRECTIONS_FILE = RUN_LOG.parent / "corrections.jsonl"
+
+# What each prompt version is made of. evaluate.py scores these modes; the live
+# pipeline runs LIVE_MODE.
+PROMPT_MODES = {
+    # mode:          (tell the date?, use examples?, fields shown in examples)
+    "baseline":      (False, False, None),           # v1
+    "fewshot":       (False, True, ALL_FIELDS),      # v2
+    "rules":         (True, False, None),            # v3
+    "rules-fewshot": (True, True, ("urgency",)),     # v4
+}
+
+# The version the live pipeline uses. Only change this when
+# `python evaluate.py --gate <candidate>` says PROMOTE.
+# 2026-10-06: promoted by the gate, v1 6/10 -> v4 9/10
+LIVE_MODE = "rules-fewshot"
 
 CATEGORIES = ["Cosmetics", "Electronics", "General", "Fashion", "Home"]
 
@@ -447,7 +466,14 @@ def associate_deal_with_contact(deal_id: str, contact_id: str) -> None:
     check(response, "deal-contact association")
 
 
-def log_run(submission: dict, enrichment: dict, deal_id: str, contact_id: str):
+def log_run(
+    submission: dict,
+    enrichment: dict,
+    deal_id: str,
+    contact_id: str,
+    received: date,
+    examples: list,
+):
     """Append one line per processed submission to the run log.
 
     The deal id is the join key: when a reviewer later edits the deal in
@@ -456,10 +482,14 @@ def log_run(submission: dict, enrichment: dict, deal_id: str, contact_id: str):
     """
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "received": received.isoformat(),
         "deal_id": deal_id,
         "contact_id": contact_id,
         "model": GEMINI_MODEL,
         "prompt_version": enrichment["prompt_version"],
+        # Which past reviews were shown as examples, to trace a bad answer
+        # back to the example that caused it.
+        "examples": [e["deal_id"] for e in examples],
         "company_name": submission["company_name"],
         "product_request": submission["product_request"],
         "raw_output": enrichment["raw_output"],
@@ -475,17 +505,37 @@ def log_run(submission: dict, enrichment: dict, deal_id: str, contact_id: str):
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def process_submission(submission: dict) -> dict:
+def live_prompt_inputs(product_request: str, received: date) -> tuple:
+    """The examples and date the live prompt gets, according to LIVE_MODE.
+
+    The example pool is re-read on every call, so a correction captured by
+    capture_corrections.py is used from the very next submission on.
+    """
+    tell_date, use_examples, example_fields = PROMPT_MODES[LIVE_MODE]
+    examples = []
+    if use_examples and CORRECTIONS_FILE.exists():
+        examples = find_similar(product_request, load_pool(CORRECTIONS_FILE))
+    block = format_examples(examples, example_fields) if examples else ""
+    received_text = format_received(received) if tell_date else None
+    return examples, block, received_text
+
+
+def process_submission(submission: dict, received: date = None) -> dict:
     """Enrich one submission, write it to HubSpot and log the run.
 
-    Shared by both entry points so the form path and the file path cannot
-    drift apart.
+    received is the day the request came in (the form's timestamp); it
+    defaults to today. Shared by both entry points so the form path and the
+    file path cannot drift apart.
     """
-    enrichment = enrich_with_gemini(submission["product_request"])
+    received = received or date.today()
+    examples, block, received_text = live_prompt_inputs(
+        submission["product_request"], received
+    )
+    enrichment = enrich_with_gemini(submission["product_request"], block, received_text)
     contact_id = upsert_contact(submission, enrichment)
     deal_id = create_deal(submission, enrichment)
     associate_deal_with_contact(deal_id, contact_id)
-    log_run(submission, enrichment, deal_id, contact_id)
+    log_run(submission, enrichment, deal_id, contact_id, received, examples)
     return {"enrichment": enrichment, "deal_id": deal_id, "contact_id": contact_id}
 
 
@@ -521,18 +571,28 @@ def main() -> int:
     failures = 0
     for path in args.submissions:
         submission = load_submission(path)
+        # A file may say when the request came in ("received": "2026-10-05");
+        # otherwise it is treated as arriving today.
+        received = (
+            date.fromisoformat(submission["received"])
+            if submission.get("received")
+            else date.today()
+        )
         print(f"Processing inquiry from {submission['company_name']} ({path})...")
 
         if args.dry_run:
-            print("DRY RUN - no API calls made.\n")
+            _, block, received_text = live_prompt_inputs(
+                submission["product_request"], received
+            )
+            print(f"DRY RUN - no API calls made. Live mode: {LIVE_MODE}\n")
             print("Prompt that would be sent to Gemini:")
             print("-" * 60)
-            print(build_prompt(submission["product_request"]))
+            print(build_prompt(submission["product_request"], block, received_text))
             print("-" * 60 + "\n")
             continue
 
         try:
-            result = process_submission(submission)
+            result = process_submission(submission, received)
         except Exception as error:
             # Same rule as the sheet path: one bad submission does not stop
             # the batch.

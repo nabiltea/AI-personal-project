@@ -15,6 +15,7 @@ Run:
 import argparse
 import os
 import sys
+from datetime import datetime
 
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
@@ -35,6 +36,12 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # Column header on the responses sheet used to record that a row is done.
 # Add this header yourself in the first empty column; Forms will not touch it.
 PROCESSED_HEADER = "Processed"
+
+# Google Forms writes the submission time in the first column, formatted by the
+# spreadsheet's locale. This sheet is en_GB (day first): "28/04/2026 09:33:16".
+# Change this if the sheet's locale changes, or 06/10 will be read the wrong way.
+TIMESTAMP_HEADER = "Timestamp"
+TIMESTAMP_FORMAT = "%d/%m/%Y %H:%M:%S"
 
 # Maps the fields the pipeline needs to the words that appear in the sheet's
 # header row. Matching on header text rather than column position means the
@@ -88,6 +95,16 @@ def resolve_columns(headers: list) -> dict:
             "script can record which rows it has already handled."
         )
     resolved["_processed"] = processed_index
+
+    # Optional: without it, requests are treated as arriving today.
+    resolved["_timestamp"] = next(
+        (
+            position
+            for position, header in enumerate(normalised)
+            if header == TIMESTAMP_HEADER.lower()
+        ),
+        None,
+    )
     return resolved
 
 
@@ -104,6 +121,20 @@ def row_to_submission(row: list, columns: dict) -> dict:
         "company_email": cell(row, columns["company_email"]),
         "product_request": cell(row, columns["product_request"]),
     }
+
+
+def row_received(row: list, columns: dict):
+    """The day the form was submitted, or None if it cannot be read.
+
+    Urgency is counted from this date, so a batch processed days later still
+    judges "by Friday" against the Friday the buyer meant.
+    """
+    if columns["_timestamp"] is None:
+        return None
+    try:
+        return datetime.strptime(cell(row, columns["_timestamp"]), TIMESTAMP_FORMAT).date()
+    except ValueError:
+        return None
 
 
 def is_processed(row: list, columns: dict) -> bool:
@@ -202,19 +233,24 @@ def main() -> int:
     for position, row in pending:
         sheet_row_number = position + 2  # +1 for header, +1 for 1-based rows
         submission = row_to_submission(row, columns)
+        received = row_received(row, columns)
         label = submission["company_name"] or f"row {sheet_row_number}"
 
         if not submission_is_complete(submission):
             print(f"Row {sheet_row_number} ({label}): skipped, missing fields.")
             continue
 
+        received_note = received.isoformat() if received else "unreadable, using today"
         if args.dry_run:
-            print(f"Row {sheet_row_number} ({label}): would process.")
+            print(
+                f"Row {sheet_row_number} ({label}): would process "
+                f"(received {received_note})."
+            )
             continue
 
-        print(f"Row {sheet_row_number} ({label}): processing...")
+        print(f"Row {sheet_row_number} ({label}): processing (received {received_note})...")
         try:
-            result = process_submission(submission)
+            result = process_submission(submission, received)
         except Exception as error:
             # One bad submission should not stop the rest of the batch. The row
             # stays unmarked, so the next run retries it.
