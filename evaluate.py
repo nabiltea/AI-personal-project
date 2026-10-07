@@ -80,7 +80,7 @@ def save_result(record: dict) -> None:
 
 def score(mode: str, pool_path: Path, dry_run: bool) -> None:
     cases = load_test_set()
-    tell_date, use_examples, example_fields = PROMPT_MODES[mode]
+    tell_date, use_examples, example_fields, ask_alternative = PROMPT_MODES[mode]
     pool = load_pool(pool_path) if use_examples else []
     check_no_leak(cases, pool)
 
@@ -102,13 +102,16 @@ def score(mode: str, pool_path: Path, dry_run: bool) -> None:
 
         if dry_run:
             print(f"===== {case['id']} =====")
-            print(build_prompt(case["product_request"], block, received), "\n")
+            print(build_prompt(case["product_request"], block, received, ask_alternative), "\n")
             continue
 
         expected = {f: case[f] for f in SCORED_FIELDS}
         try:
-            answer = enrich_with_gemini(case["product_request"], block, received)
+            answer = enrich_with_gemini(
+                case["product_request"], block, received, ask_alternative
+            )
             predicted = {f: answer[f] for f in SCORED_FIELDS}
+            flags = answer["flags"]
             prompt_version, error = answer["prompt_version"], None
         except QuotaExhausted as stop:
             # Nothing is saved for this case, so the next run picks it up.
@@ -117,6 +120,7 @@ def score(mode: str, pool_path: Path, dry_run: bool) -> None:
         except Exception as failure:
             # A broken answer counts as wrong: in production it would be.
             predicted = {f: None for f in SCORED_FIELDS}
+            flags = []
             prompt_version, error = None, str(failure)
 
         correct = {f: predicted[f] == expected[f] for f in SCORED_FIELDS}
@@ -129,6 +133,9 @@ def score(mode: str, pool_path: Path, dry_run: bool) -> None:
                 "expected": expected,
                 "predicted": predicted,
                 "correct": correct,
+                # Kept so the report can check whether flags land on the
+                # cases the model actually gets wrong.
+                "flags": flags,
                 "examples": [e["deal_id"] for e in examples],
                 "error": error,
             }
@@ -196,7 +203,8 @@ def report() -> None:
             return "error"
         p = result["predicted"]
         mark = "ok" if all(result["correct"].values()) else "XX"
-        return f"{p['category'][:5]} u{p['urgency']} {mark}"
+        flagged = " f" if result.get("flags") else ""
+        return f"{p['category'][:5]} u{p['urgency']} {mark}{flagged}"
 
     print(f"\n{'case':<5} {'expected':<12}" + "".join(f"{run:<26}" for run in runs))
     for case in cases:
@@ -213,6 +221,25 @@ def report() -> None:
         ]
         both = sum(all(r["correct"].values()) for r in scored)
         print(f"{run:<26} " + ", ".join(parts) + f", both right {both}/{n}")
+
+    # How good are the flags? A useful flag lands on the cases the model gets
+    # wrong and leaves the right ones alone. Older runs did not record flags.
+    flag_runs = [
+        run for run in runs
+        if all("flags" in latest[(run, c["id"])] for c in cases if (run, c["id"]) in latest)
+    ]
+    if flag_runs:
+        print("\nflags (f in the table): would the right cases have gone to review?")
+    for run in flag_runs:
+        scored = [latest[(run, c["id"])] for c in cases if (run, c["id"]) in latest]
+        wrong = [r for r in scored if not all(r["correct"].values())]
+        flagged = [r for r in scored if r["flags"]]
+        caught = [r for r in flagged if not all(r["correct"].values())]
+        print(
+            f"{run:<26} flagged {len(flagged)}/{len(scored)}, caught "
+            f"{len(caught)} of {len(wrong)} mistakes, "
+            f"{len(flagged) - len(caught)} flagged cases were right"
+        )
 
 
 def main() -> int:

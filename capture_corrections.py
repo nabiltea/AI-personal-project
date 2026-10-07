@@ -1,11 +1,13 @@
 """
 Capture the corrections a reviewer made on the HubSpot deal board.
 
-Every enriched deal lands in "Rep Review Required". The reviewer fixes the
-category or urgency if the model got them wrong, then moves the deal on. This
-script finds the deals that have left the review stage, compares what the model
-said (from data/runs.jsonl) with what the reviewer kept (from HubSpot), and
-writes one record per reviewed deal to data/corrections.jsonl.
+Flagged deals (and a random share of the rest) are sent to "Rep Review
+Required". The reviewer fixes the category or urgency if the model got them
+wrong, then moves the deal on. This script finds the deals that were sent to
+review and have since left it, compares what the model said (from
+data/runs.jsonl) with what the reviewer kept (from HubSpot), and writes one
+record per reviewed deal to data/corrections.jsonl. Deals that went straight to
+outreach were never checked, so they are left out.
 
 Run:
     python capture_corrections.py
@@ -19,7 +21,7 @@ import requests
 from enrich_lead import (
     CORRECTIONS_FILE,
     DEAL_PROPERTIES,
-    DEAL_STAGE as REVIEW_STAGE,
+    STAGE_REVIEW as REVIEW_STAGE,
     HUBSPOT_BASE,
     RUN_LOG,
     check,
@@ -108,7 +110,9 @@ def build_correction(run: dict, final: dict) -> dict:
 
 
 def main() -> int:
-    runs = load_runs()
+    # Runs logged before routing existed have no "sent_to_review" field; back
+    # then every deal went to review, so they count as sent.
+    runs = [run for run in load_runs() if run.get("sent_to_review", True)]
     deals = fetch_deals([run["deal_id"] for run in runs])
 
     corrections, waiting, sent_back = [], 0, 0

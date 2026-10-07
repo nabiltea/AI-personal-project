@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import random
 import sys
 import time
 from datetime import date, datetime, timezone
@@ -50,12 +51,19 @@ DEFAULT_RETRY_SECONDS = 30
 # means the daily quota is used up, and sleeping for hours helps nobody.
 MAX_RETRY_WAIT_SECONDS = 120
 
-# Deal pipeline/stage the new deal lands in. Renamed stages keep their original
-# internal ids, so "presentationscheduled" is what this account calls
-# "Stage 2: Rep Review Required". Every AI-enriched deal goes there so a person
-# checks it; those checks are the labels the evaluation is built on.
+# Deal pipeline and stages. Renamed stages keep their original internal ids.
+# Every deal is created in Stage 1, then moved on: to review if anything about
+# it looks doubtful, straight to outreach if not.
 DEAL_PIPELINE = "default"
-DEAL_STAGE = "presentationscheduled"
+STAGE_NEW = "appointmentscheduled"        # Stage 1: New Inbound Request
+STAGE_REVIEW = "presentationscheduled"    # Stage 2: Rep Review Required
+STAGE_OUTREACH = "decisionmakerboughtin"  # Stage 3: Active Outreach
+
+# Share of unflagged deals sent to review anyway, so mistakes the flags miss
+# still get found and the flags themselves can be checked. Kept high while
+# there is little evidence the flags are reliable; lower it once spot-checks
+# keep coming back clean.
+SPOT_CHECK_RATE = 0.2
 
 # Prompt versions, recorded on every run and deal so accuracy can be compared
 # per version (see prompt_version()). Add a new one whenever the prompt changes.
@@ -63,6 +71,7 @@ DEAL_STAGE = "presentationscheduled"
 #   v2  v1 + similar past reviewed requests as examples (see examples.py)
 #   v3  v1 + the date the request came in + the written urgency rules
 #   v4  v3 + similar past reviewed requests, showing urgency only
+#   v5  v4 + asks whether another category could also fit, to flag ambiguity
 
 RUN_LOG = Path(__file__).resolve().parent / "data" / "runs.jsonl"
 # Every deal a rep has reviewed; the example pool for v2 and v4.
@@ -71,11 +80,13 @@ CORRECTIONS_FILE = RUN_LOG.parent / "corrections.jsonl"
 # What each prompt version is made of. evaluate.py scores these modes; the live
 # pipeline runs LIVE_MODE.
 PROMPT_MODES = {
-    # mode:          (tell the date?, use examples?, fields shown in examples)
-    "baseline":      (False, False, None),           # v1
-    "fewshot":       (False, True, ALL_FIELDS),      # v2
-    "rules":         (True, False, None),            # v3
-    "rules-fewshot": (True, True, ("urgency",)),     # v4
+    # mode:              (tell the date?, use examples?, fields shown in
+    #                     examples, ask for a second possible category?)
+    "baseline":          (False, False, None, False),          # v1
+    "fewshot":           (False, True, ALL_FIELDS, False),     # v2
+    "rules":             (True, False, None, False),           # v3
+    "rules-fewshot":     (True, True, ("urgency",), False),    # v4
+    "rules-fewshot-alt": (True, True, ("urgency",), True),     # v5
 }
 
 # The version the live pipeline uses. Only change this when
@@ -157,20 +168,37 @@ def format_received(day: date) -> str:
     return f"{day:%A} {day.day} {day:%B %Y}"
 
 
-def prompt_version(examples_block: str = "", received: str = None) -> str:
+# v5: one extra field in the JSON. Models are poor at putting a number on their
+# own confidence, but answer "could it also be X?" well, and a product that fits
+# two categories (kettles: Home or Electronics?) is exactly where v4 goes wrong.
+OTHER_CATEGORY_FIELD = (
+    ',\n  "other_category": "If another category from the same list could also '
+    'reasonably fit this request, name it. Otherwise write none"}'
+)
+
+
+def prompt_version(
+    examples_block: str = "", received: str = None, ask_alternative: bool = False
+) -> str:
+    if ask_alternative:
+        return "v5"
     if received:
         return "v4" if examples_block else "v3"
     return "v2" if examples_block else "v1"
 
 
 def build_prompt(
-    product_request: str, examples_block: str = "", received: str = None
+    product_request: str,
+    examples_block: str = "",
+    received: str = None,
+    ask_alternative: bool = False,
 ) -> str:
     """Fill in the prompt template, optionally with a date and past examples.
 
     received (e.g. "Monday 5 October 2026") switches to the v3 template with
-    the urgency rules. Examples go just before the buyer's request. With
-    neither, the prompt is exactly v1, so v1 results stay comparable.
+    the urgency rules. Examples go just before the buyer's request.
+    ask_alternative adds the v5 "other_category" field. With none of them, the
+    prompt is exactly v1, so earlier results stay comparable.
     """
     template = PROMPT_TEMPLATE_V3 if received else PROMPT_TEMPLATE
     prompt = template.format(
@@ -182,6 +210,9 @@ def build_prompt(
         prompt = prompt.replace(
             REQUEST_HEADING, f"{examples_block}\n\n{REQUEST_HEADING}", 1
         )
+    if ask_alternative:
+        # The template ends with the closing brace of the JSON description.
+        prompt = prompt[: prompt.rindex("}")] + OTHER_CATEGORY_FIELD
     return prompt
 
 
@@ -195,7 +226,9 @@ def strip_code_fences(text: str) -> str:
     return cleaned.replace("```", "").strip()
 
 
-def validate_enrichment(data: dict, product_request: str = "") -> dict:
+def validate_enrichment(
+    data: dict, product_request: str = "", ask_alternative: bool = False
+) -> dict:
     """Coerce the model's output into something safe to write to a CRM.
 
     An LLM will occasionally return urgency as "2" or "high", or invent a
@@ -238,10 +271,23 @@ def validate_enrichment(data: dict, product_request: str = "") -> dict:
     if len(product_request.split()) < SHORT_REQUEST_WORDS:
         flags.append("short_request")
 
+    other_category = None
+    if ask_alternative:
+        raw_other = str(data.get("other_category", "")).strip()
+        other_category = next(
+            (c for c in CATEGORIES if c.lower() == raw_other.lower()), None
+        )
+        # "none", an invented category or the same one again mean no doubt.
+        if other_category == category:
+            other_category = None
+        if other_category:
+            flags.append(f"ambiguous_category:{other_category}")
+
     return {
         "summary": summary,
         "urgency": urgency,
         "category": category,
+        "other_category": other_category,
         "flags": flags,
     }
 
@@ -266,17 +312,21 @@ def retry_delay_seconds(response: requests.Response) -> int:
 
 
 def enrich_with_gemini(
-    product_request: str, examples_block: str = "", received: str = None
+    product_request: str,
+    examples_block: str = "",
+    received: str = None,
+    ask_alternative: bool = False,
 ) -> dict:
     """Send the free-text request to Gemini and return validated fields.
 
     The raw model text is kept alongside the validated fields so the run log
     shows what the model actually said, not just what survived validation.
-    examples_block and received select the prompt version (see build_prompt).
+    The keyword arguments select the prompt version (see build_prompt).
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set. See .env.example.")
 
+    prompt = build_prompt(product_request, examples_block, received, ask_alternative)
     for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
         response = requests.post(
             GEMINI_URL,
@@ -285,13 +335,7 @@ def enrich_with_gemini(
                 "x-goog-api-key": GEMINI_API_KEY,
             },
             json={
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": build_prompt(product_request, examples_block, received)}
-                        ]
-                    }
-                ],
+                "contents": [{"parts": [{"text": prompt}]}],
                 # temperature 0 keeps classifications stable across identical
                 # submissions, which matters more here than variety.
                 # gemini-2.5-flash "thinks" before answering and that thinking
@@ -322,9 +366,11 @@ def enrich_with_gemini(
     except ValueError:
         # Show what came back; a bare JSON error hides the actual cause.
         raise RuntimeError(f"Gemini did not return valid JSON: {raw_text[:300]!r}")
-    enrichment = validate_enrichment(parsed, product_request)
+    enrichment = validate_enrichment(parsed, product_request, ask_alternative)
     enrichment["raw_output"] = raw_text
-    enrichment["prompt_version"] = prompt_version(examples_block, received)
+    enrichment["prompt_version"] = prompt_version(
+        examples_block, received, ask_alternative
+    )
     return enrichment
 
 
@@ -439,7 +485,7 @@ def create_deal(submission: dict, enrichment: dict) -> str:
             "properties": {
                 "dealname": f"{submission['company_name']} - Wholesale Order",
                 "pipeline": DEAL_PIPELINE,
-                "dealstage": DEAL_STAGE,
+                "dealstage": STAGE_NEW,
                 # The buyer's own words, so the reviewer can judge the AI fields
                 # against the source. The AI summary lives in order_summary.
                 "description": submission["product_request"],
@@ -466,6 +512,31 @@ def associate_deal_with_contact(deal_id: str, contact_id: str) -> None:
     check(response, "deal-contact association")
 
 
+def move_deal(deal_id: str, stage: str) -> None:
+    response = requests.patch(
+        f"{HUBSPOT_BASE}/crm/v3/objects/deals/{deal_id}",
+        headers=hubspot_headers(),
+        json={"properties": {"dealstage": stage}},
+        timeout=30,
+    )
+    check(response, "deal stage update")
+
+
+def route(flags: list) -> tuple:
+    """Decide where a deal goes after Stage 1. Returns (stage, flags).
+
+    Anything flagged goes to review. Of the rest, a random share goes to
+    review as a spot-check, labelled as such so the evaluation can tell "looked
+    doubtful" apart from "picked at random". Everything else goes straight to
+    outreach.
+    """
+    if flags:
+        return STAGE_REVIEW, flags
+    if random.random() < SPOT_CHECK_RATE:
+        return STAGE_REVIEW, ["spot_check"]
+    return STAGE_OUTREACH, flags
+
+
 def log_run(
     submission: dict,
     enrichment: dict,
@@ -473,6 +544,7 @@ def log_run(
     contact_id: str,
     received: date,
     examples: list,
+    sent_to_review: bool,
 ):
     """Append one line per processed submission to the run log.
 
@@ -497,8 +569,12 @@ def log_run(
             "summary": enrichment["summary"],
             "urgency": enrichment["urgency"],
             "category": enrichment["category"],
+            "other_category": enrichment.get("other_category"),
         },
         "flags": enrichment["flags"],
+        # Only deals a person looked at can teach the model anything; deals
+        # sent straight to outreach must not be mistaken for confirmed ones.
+        "sent_to_review": sent_to_review,
     }
     RUN_LOG.parent.mkdir(exist_ok=True)
     with open(RUN_LOG, "a", encoding="utf-8") as handle:
@@ -511,13 +587,13 @@ def live_prompt_inputs(product_request: str, received: date) -> tuple:
     The example pool is re-read on every call, so a correction captured by
     capture_corrections.py is used from the very next submission on.
     """
-    tell_date, use_examples, example_fields = PROMPT_MODES[LIVE_MODE]
+    tell_date, use_examples, example_fields, ask_alternative = PROMPT_MODES[LIVE_MODE]
     examples = []
     if use_examples and CORRECTIONS_FILE.exists():
         examples = find_similar(product_request, load_pool(CORRECTIONS_FILE))
     block = format_examples(examples, example_fields) if examples else ""
     received_text = format_received(received) if tell_date else None
-    return examples, block, received_text
+    return examples, block, received_text, ask_alternative
 
 
 def process_submission(submission: dict, received: date = None) -> dict:
@@ -528,15 +604,29 @@ def process_submission(submission: dict, received: date = None) -> dict:
     file path cannot drift apart.
     """
     received = received or date.today()
-    examples, block, received_text = live_prompt_inputs(
+    examples, block, received_text, ask_alternative = live_prompt_inputs(
         submission["product_request"], received
     )
-    enrichment = enrich_with_gemini(submission["product_request"], block, received_text)
+    enrichment = enrich_with_gemini(
+        submission["product_request"], block, received_text, ask_alternative
+    )
+    # Decided before the deal is created so a spot-check shows in AI Flags.
+    next_stage, enrichment["flags"] = route(enrichment["flags"])
+
     contact_id = upsert_contact(submission, enrichment)
-    deal_id = create_deal(submission, enrichment)
+    deal_id = create_deal(submission, enrichment)  # lands in Stage 1
     associate_deal_with_contact(deal_id, contact_id)
-    log_run(submission, enrichment, deal_id, contact_id, received, examples)
-    return {"enrichment": enrichment, "deal_id": deal_id, "contact_id": contact_id}
+    move_deal(deal_id, next_stage)
+    log_run(
+        submission, enrichment, deal_id, contact_id, received, examples,
+        sent_to_review=next_stage == STAGE_REVIEW,
+    )
+    return {
+        "enrichment": enrichment,
+        "deal_id": deal_id,
+        "contact_id": contact_id,
+        "sent_to_review": next_stage == STAGE_REVIEW,
+    }
 
 
 def load_submission(path: str) -> dict:
@@ -581,13 +671,17 @@ def main() -> int:
         print(f"Processing inquiry from {submission['company_name']} ({path})...")
 
         if args.dry_run:
-            _, block, received_text = live_prompt_inputs(
+            _, block, received_text, ask_alternative = live_prompt_inputs(
                 submission["product_request"], received
             )
             print(f"DRY RUN - no API calls made. Live mode: {LIVE_MODE}\n")
             print("Prompt that would be sent to Gemini:")
             print("-" * 60)
-            print(build_prompt(submission["product_request"], block, received_text))
+            print(
+                build_prompt(
+                    submission["product_request"], block, received_text, ask_alternative
+                )
+            )
             print("-" * 60 + "\n")
             continue
 
@@ -602,9 +696,10 @@ def main() -> int:
 
         enrichment = result["enrichment"]
         flags = ", ".join(enrichment["flags"]) or "none"
+        where = "Stage 2 (review)" if result["sent_to_review"] else "Stage 3 (outreach)"
         print(
             f"  {enrichment['category']} / urgency {enrichment['urgency']} "
-            f"-> deal {result['deal_id']} (flags: {flags})\n"
+            f"-> deal {result['deal_id']} -> {where} (flags: {flags})\n"
         )
 
     if not args.dry_run:
