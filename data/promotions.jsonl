@@ -1,0 +1,3 @@
+{"promoted_at": "2026-09-24", "mode": "baseline", "pool": null, "run": "baseline", "test_set": null, "score": null, "note": "part one, before the gate existed"}
+{"promoted_at": "2026-10-06", "mode": "rules-fewshot", "pool": "data/pools/pool-6d501de8.jsonl", "run": "rules-fewshot:pool-6d501de8", "test_set": "test_set.json", "score": "9/10 vs 6/10", "note": "recorded afterwards"}
+{"promoted_at": "2026-10-07", "mode": "rules-fewshot-alt", "pool": "data/pools/pool-6d501de8.jsonl", "run": "rules-fewshot-alt:pool-6d501de8", "test_set": "test_set.json", "score": "10/10 vs 9/10", "note": "recorded afterwards"}

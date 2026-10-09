@@ -16,6 +16,7 @@ Run:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,9 +45,11 @@ HUBSPOT_BASE = "https://api.hubapi.com"
 
 # The Gemini free tier allows only a few requests per minute. When it says
 # "too many requests" (429), wait and try again rather than failing the
-# submission.
+# submission. The same goes for Google's servers being briefly overloaded
+# (5xx, usually 503): those clear up by themselves within seconds.
 GEMINI_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_SECONDS = 30
+SERVER_ERRORS = {500, 502, 503, 504}
 # A per-minute limit asks for a wait of under a minute. A much longer wait
 # means the daily quota is used up, and sleeping for hours helps nobody.
 MAX_RETRY_WAIT_SECONDS = 120
@@ -73,12 +76,19 @@ SPOT_CHECK_RATE = 0.2
 #   v4  v3 + similar past reviewed requests, showing urgency only
 #   v5  v4 + asks whether another category could also fit, to flag ambiguity
 
-RUN_LOG = Path(__file__).resolve().parent / "data" / "runs.jsonl"
-# Every deal a rep has reviewed; the example pool for v2 and v4.
+PROJECT_DIR = Path(__file__).resolve().parent
+RUN_LOG = PROJECT_DIR / "data" / "runs.jsonl"
+# Every deal a rep has reviewed. This is the *candidate* example pool: new
+# corrections land here, but only reach the live pipeline through a promotion.
 CORRECTIONS_FILE = RUN_LOG.parent / "corrections.jsonl"
 
+# Which version the live pipeline runs, and the frozen snapshot of the example
+# pool it was tested with. Written only by `evaluate.py --gate ... --promote`.
+LIVE_FILE = RUN_LOG.parent / "live.json"
+POOLS_DIR = RUN_LOG.parent / "pools"
+
 # What each prompt version is made of. evaluate.py scores these modes; the live
-# pipeline runs LIVE_MODE.
+# pipeline runs the one named in LIVE_FILE.
 PROMPT_MODES = {
     # mode:              (tell the date?, use examples?, fields shown in
     #                     examples, ask for a second possible category?)
@@ -88,11 +98,6 @@ PROMPT_MODES = {
     "rules-fewshot":     (True, True, ("urgency",), False),    # v4
     "rules-fewshot-alt": (True, True, ("urgency",), True),     # v5
 }
-
-# The version the live pipeline uses. Only change this when
-# `python evaluate.py --gate <candidate>` says PROMOTE.
-# 2026-10-06: promoted by the gate, v1 6/10 -> v4 9/10
-LIVE_MODE = "rules-fewshot"
 
 CATEGORIES = ["Cosmetics", "Electronics", "General", "Fashion", "Home"]
 
@@ -156,6 +161,27 @@ additional text, markdown, or formatting:
   "category": "Pick the single best fit from this exact list: {categories}"}}"""
 
 REQUEST_HEADING = "Here is the request from the buyer:"
+
+
+def pool_id(path) -> str:
+    """Name an example pool by its contents, e.g. "pool-6d501de8".
+
+    corrections.jsonl changes every time new reviews are captured, so its file
+    name says nothing about what was in it. A fingerprint of the contents does:
+    the same corrections always give the same id.
+    """
+    return "pool-" + hashlib.sha1(Path(path).read_bytes()).hexdigest()[:8]
+
+
+def load_live() -> dict:
+    """The live version: {"mode": ..., "pool": snapshot path or None, ...}."""
+    if LIVE_FILE.exists():
+        return json.loads(LIVE_FILE.read_text(encoding="utf-8"))
+    return {"mode": "baseline", "pool": None}
+
+
+def live_pool_path(live: dict):
+    return PROJECT_DIR / live["pool"] if live.get("pool") else None
 
 
 def format_received(day: date) -> str:
@@ -345,15 +371,23 @@ def enrich_with_gemini(
             },
             timeout=30,
         )
-        if response.status_code != 429 or attempt == GEMINI_MAX_ATTEMPTS:
+        status = response.status_code
+        if status not in SERVER_ERRORS | {429} or attempt == GEMINI_MAX_ATTEMPTS:
             break
-        wait = retry_delay_seconds(response)
-        if wait > MAX_RETRY_WAIT_SECONDS:
-            raise QuotaExhausted(
-                f"Gemini daily quota used up; it resets in about "
-                f"{wait / 3600:.1f} hours."
-            )
-        print(f"  Gemini rate limit hit, waiting {wait}s (attempt {attempt})...")
+        if status == 429:
+            wait = retry_delay_seconds(response)
+            if wait > MAX_RETRY_WAIT_SECONDS:
+                raise QuotaExhausted(
+                    f"Gemini daily quota used up; it resets in about "
+                    f"{wait / 3600:.1f} hours."
+                )
+            reason = "rate limit hit"
+        else:
+            # No retry delay is given for server errors, so back off: 5s, 10s,
+            # 20s, 40s.
+            wait = 5 * 2 ** (attempt - 1)
+            reason = f"Gemini unavailable ({status})"
+        print(f"  {reason}, waiting {wait}s (attempt {attempt})...")
         time.sleep(wait)
     response.raise_for_status()
 
@@ -582,15 +616,18 @@ def log_run(
 
 
 def live_prompt_inputs(product_request: str, received: date) -> tuple:
-    """The examples and date the live prompt gets, according to LIVE_MODE.
+    """The examples and date the live prompt gets, according to LIVE_FILE.
 
-    The example pool is re-read on every call, so a correction captured by
-    capture_corrections.py is used from the very next submission on.
+    Examples come from the frozen pool snapshot that passed the gate, not from
+    corrections.jsonl. New corrections only reach live deals once a gate run
+    with them has passed, so a batch of bad reviews can't slip in unchecked.
     """
-    tell_date, use_examples, example_fields, ask_alternative = PROMPT_MODES[LIVE_MODE]
+    live = load_live()
+    tell_date, use_examples, example_fields, ask_alternative = PROMPT_MODES[live["mode"]]
+    pool_path = live_pool_path(live)
     examples = []
-    if use_examples and CORRECTIONS_FILE.exists():
-        examples = find_similar(product_request, load_pool(CORRECTIONS_FILE))
+    if use_examples and pool_path and pool_path.exists():
+        examples = find_similar(product_request, load_pool(pool_path))
     block = format_examples(examples, example_fields) if examples else ""
     received_text = format_received(received) if tell_date else None
     return examples, block, received_text, ask_alternative
@@ -674,7 +711,11 @@ def main() -> int:
             _, block, received_text, ask_alternative = live_prompt_inputs(
                 submission["product_request"], received
             )
-            print(f"DRY RUN - no API calls made. Live mode: {LIVE_MODE}\n")
+            live = load_live()
+            print(
+                f"DRY RUN - no API calls made. Live: {live['mode']} "
+                f"(pool: {live.get('pool') or 'none'})\n"
+            )
             print("Prompt that would be sent to Gemini:")
             print("-" * 60)
             print(

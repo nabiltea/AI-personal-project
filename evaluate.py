@@ -1,13 +1,21 @@
 """
-Score the classifier against the hand-labelled test set (data/test_set.json).
+Score prompt versions against a hand-labelled test set, compare them, and
+decide which one the live pipeline runs.
 
 Run:
-    python evaluate.py --mode baseline             # v1: original prompt
-    python evaluate.py --mode fewshot              # v2: v1 + similar past reviews
-    python evaluate.py --mode rules                # v3: v1 + date + urgency rules
-    python evaluate.py --mode rules-fewshot        # v4: v3 + past reviews, urgency only
-    python evaluate.py --mode rules --dry-run      # print the prompts, no API calls
-    python evaluate.py --report                    # compare everything scored so far
+    python evaluate.py --mode baseline              # v1: original prompt
+    python evaluate.py --mode fewshot               # v2: v1 + similar past reviews
+    python evaluate.py --mode rules                 # v3: v1 + date + urgency rules
+    python evaluate.py --mode rules-fewshot         # v4: v3 + past reviews, urgency only
+    python evaluate.py --mode rules-fewshot-alt     # v5: v4 + "could it be another category?"
+    python evaluate.py --mode rules --dry-run       # print the prompts, no API calls
+    python evaluate.py --report                     # compare everything scored so far
+    python evaluate.py --gate rules-fewshot-alt     # compare with the live version
+    python evaluate.py --gate rules-fewshot-alt --promote   # ...and switch if it passes
+    python evaluate.py --rollback                   # undo the last promotion
+
+Add --test-set data/<file>.json to use a different test set. Modes that use
+examples take them from data/corrections.jsonl unless --pool says otherwise.
 
 Each answer is saved to data/eval_results.jsonl the moment it comes back, and a
 re-run skips cases already scored in the same run. On the free tier (20 Gemini
@@ -16,6 +24,7 @@ requests a day) a crash halfway must not throw away answers already paid for.
 
 import argparse
 import json
+import shutil
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -23,25 +32,39 @@ from pathlib import Path
 from capture_corrections import SCORED_FIELDS
 from enrich_lead import (
     CORRECTIONS_FILE,
-    LIVE_MODE,
+    LIVE_FILE,
+    POOLS_DIR,
+    PROJECT_DIR,
     PROMPT_MODES,
     QuotaExhausted,
     build_prompt,
     enrich_with_gemini,
     format_received,
+    live_pool_path,
+    load_live,
+    pool_id,
 )
 from examples import find_similar, format_examples, load_pool
 
-DATA = Path(__file__).resolve().parent / "data"
-TEST_SET = DATA / "test_set.json"
+DATA = PROJECT_DIR / "data"
+DEFAULT_TEST_SET = DATA / "test_set.json"
 RESULTS = DATA / "eval_results.jsonl"
-
-# Each test case stores the date it "came in" (its labels are correct relative
-# to that date), so the result is the same whenever the evaluation is run.
+PROMOTIONS = DATA / "promotions.jsonl"
 
 
-def load_test_set() -> list:
-    with open(TEST_SET, encoding="utf-8") as handle:
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_test_set(path: Path) -> list:
+    """Load and check a test set.
+
+    Each case stores the date it "came in" (its labels are correct relative to
+    that date), so the result is the same whenever the evaluation is run. An
+    optional "needs_review" label says whether a person should see the case,
+    which is what the flags are scored against.
+    """
+    with open(path, encoding="utf-8") as handle:
         cases = json.load(handle)
     required = list(SCORED_FIELDS) + ["received"]
     incomplete = [c["id"] for c in cases if not all(c.get(f) for f in required)]
@@ -66,11 +89,28 @@ def check_no_leak(cases: list, pool: list) -> None:
         raise RuntimeError(f"Test cases also found in the example pool: {leaked}")
 
 
-def load_results() -> list:
+def run_name(mode: str, pool_path) -> str:
+    """A run is a prompt version plus, if it uses examples, the exact pool.
+
+    The pool is named by its contents, so a run against yesterday's
+    corrections is kept apart from one against today's.
+    """
+    uses_examples = PROMPT_MODES[mode][1]
+    return f"{mode}:{pool_id(pool_path)}" if uses_examples else mode
+
+
+def live_run() -> str:
+    live = load_live()
+    return run_name(live["mode"], live_pool_path(live))
+
+
+def load_results(test_set: Path) -> list:
+    """Saved answers for one test set (older records predate --test-set)."""
     if not RESULTS.exists():
         return []
     with open(RESULTS, encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        records = [json.loads(line) for line in handle if line.strip()]
+    return [r for r in records if r.get("test_set", DEFAULT_TEST_SET.name) == test_set.name]
 
 
 def save_result(record: dict) -> None:
@@ -78,17 +118,14 @@ def save_result(record: dict) -> None:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def score(mode: str, pool_path: Path, dry_run: bool) -> None:
-    cases = load_test_set()
+def score(mode: str, pool_path: Path, test_set: Path, dry_run: bool) -> None:
+    cases = load_test_set(test_set)
     tell_date, use_examples, example_fields, ask_alternative = PROMPT_MODES[mode]
     pool = load_pool(pool_path) if use_examples else []
     check_no_leak(cases, pool)
 
-    # The run name ties results together, e.g. "baseline" or
-    # "fewshot:corrections.jsonl", so a later run with a different example pool
-    # is kept separate.
-    run = f"{mode}:{pool_path.name}" if use_examples else mode
-    done = {r["case_id"] for r in load_results() if r["run"] == run}
+    run = run_name(mode, pool_path)
+    done = {r["case_id"] for r in load_results(test_set) if r["run"] == run}
 
     for case in cases:
         if case["id"] in done:
@@ -126,7 +163,8 @@ def score(mode: str, pool_path: Path, dry_run: bool) -> None:
         correct = {f: predicted[f] == expected[f] for f in SCORED_FIELDS}
         save_result(
             {
-                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "timestamp": now(),
+                "test_set": test_set.name,
                 "run": run,
                 "prompt_version": prompt_version,
                 "case_id": case["id"],
@@ -134,7 +172,7 @@ def score(mode: str, pool_path: Path, dry_run: bool) -> None:
                 "predicted": predicted,
                 "correct": correct,
                 # Kept so the report can check whether flags land on the
-                # cases the model actually gets wrong.
+                # cases that need a person.
                 "flags": flags,
                 "examples": [e["deal_id"] for e in examples],
                 "error": error,
@@ -146,55 +184,151 @@ def score(mode: str, pool_path: Path, dry_run: bool) -> None:
         print(f"{case['id']}: {predicted} expected {expected} -> {verdict}")
 
 
-def resolve_run(name: str, runs: list) -> str:
-    """Accept a full run name ("rules-fewshot:corrections.jsonl") or a mode."""
-    if name in runs:
-        return name
-    matches = [run for run in runs if run.split(":")[0] == name]
-    if len(matches) != 1:
-        raise RuntimeError(f"No single saved run matches '{name}'. Saved: {runs}")
-    return matches[0]
+def records_for(run: str, cases: list, latest: dict) -> list:
+    missing = [c["id"] for c in cases if (run, c["id"]) not in latest]
+    if missing:
+        raise RuntimeError(f"'{run}' has not been scored on {missing} yet.")
+    return [latest[(run, c["id"])] for c in cases]
 
 
-def gate(candidate: str, current: str) -> bool:
-    """Decide whether the candidate may replace the current version.
+def flag_stats(records: list, cases: list):
+    """How well the flags pick out the cases that should go to review.
+
+    Returns None for runs from before flags were recorded. The precision and
+    recall figures need every case to carry a "needs_review" label.
+    """
+    if not records or any("flags" not in r for r in records):
+        return None
+    labels = {c["id"]: c.get("needs_review") for c in cases}
+    flagged = {r["case_id"] for r in records if r["flags"]}
+    wrong = {r["case_id"] for r in records if not all(r["correct"].values())}
+    stats = {
+        "n": len(records),
+        "flagged": len(flagged),
+        "mistakes": len(wrong),
+        "mistakes_flagged": len(wrong & flagged),
+    }
+    if all(labels[r["case_id"]] is not None for r in records):
+        needed = {cid for cid, label in labels.items() if label and cid in labels}
+        needed &= {r["case_id"] for r in records}
+        stats.update(
+            needed=len(needed),
+            needed_flagged=len(needed & flagged),
+            # Share of cases where flag and label agree, used to break ties.
+            agree=sum((r["case_id"] in flagged) == bool(labels[r["case_id"]]) for r in records),
+        )
+    return stats
+
+
+def describe_flags(stats: dict) -> str:
+    text = f"flagged {stats['flagged']}/{stats['n']} ({stats['flagged'] / stats['n']:.0%} review load)"
+    if "needed" in stats:
+        text += (
+            f", caught {stats['needed_flagged']} of {stats['needed']} cases that needed "
+            f"review, {stats['flagged'] - stats['needed_flagged']} flags were unnecessary"
+        )
+    if stats["mistakes"]:
+        text += f", {stats['mistakes_flagged']} of {stats['mistakes']} mistakes flagged"
+    else:
+        text += ", no mistakes to catch"
+    return text
+
+
+def gate(mode: str, pool_path: Path, test_set: Path, against: str = None):
+    """Decide whether a candidate may replace the current version.
 
     Rule: promote if the candidate gets at least as many test cases fully
-    right (category and urgency) as the current version. A version that
-    trades one category for three urgencies still counts as better overall.
+    right (category and urgency) as the current version. On a tie, it must
+    also be no worse at flagging, when the test set says which cases need
+    review. Returns (promote, candidate run, score text).
     """
-    cases = load_test_set()
-    results = load_results()
-    runs = list(dict.fromkeys(r["run"] for r in results))
-    candidate, current = resolve_run(candidate, runs), resolve_run(current, runs)
-    latest = {(r["run"], r["case_id"]): r for r in results}
+    cases = load_test_set(test_set)
+    latest = {(r["run"], r["case_id"]): r for r in load_results(test_set)}
+    candidate = run_name(mode, pool_path)
+    current = live_run() if against is None else run_name(against, CORRECTIONS_FILE)
 
-    scores = {}
+    if candidate == current:
+        print(f"{candidate} is already the current version.")
+        return False, candidate, None
+
+    right, flags = {}, {}
     for run in (candidate, current):
-        missing = [c["id"] for c in cases if (run, c["id"]) not in latest]
-        if missing:
-            raise RuntimeError(f"'{run}' has not been scored on {missing} yet.")
-        scores[run] = sum(all(latest[(run, c["id"])]["correct"].values()) for c in cases)
+        records = records_for(run, cases, latest)
+        right[run] = sum(all(r["correct"].values()) for r in records)
+        flags[run] = flag_stats(records, cases)
 
-    promote = scores[candidate] >= scores[current]
+    promote = right[candidate] > right[current]
+    tie_note = ""
+    if right[candidate] == right[current]:
+        both_scored = all(flags[run] and "agree" in flags[run] for run in (candidate, current))
+        promote = (not both_scored) or flags[candidate]["agree"] >= flags[current]["agree"]
+        tie_note = " (tie, decided on flags)" if both_scored else " (tie)"
+
     n = len(cases)
-    print(
-        f"candidate {candidate}: {scores[candidate]}/{n} fully right\n"
-        f"current   {current}: {scores[current]}/{n} fully right\n"
-        f"-> {'PROMOTE' if promote else 'REJECT'}"
-    )
-    return promote
+    for label, run in (("candidate", candidate), ("current  ", current)):
+        line = f"{label} {run}: {right[run]}/{n} fully right"
+        if flags[run]:
+            line += f"; {describe_flags(flags[run])}"
+        print(line)
+    print(f"-> {'PROMOTE' if promote else 'REJECT'}{tie_note}")
+    return promote, candidate, f"{right[candidate]}/{n} vs {right[current]}/{n}"
 
 
-def report() -> None:
-    """Print every case against every run, then accuracy per run."""
-    cases = load_test_set()
-    results = load_results()
+def promote(mode: str, pool_path: Path, run: str, test_set: Path, score_text: str) -> None:
+    """Make the candidate live, freezing the exact pool it was tested with."""
+    live_pool = None
+    if PROMPT_MODES[mode][1]:
+        POOLS_DIR.mkdir(parents=True, exist_ok=True)
+        snapshot = POOLS_DIR / f"{pool_id(pool_path)}.jsonl"
+        shutil.copyfile(pool_path, snapshot)
+        live_pool = str(snapshot.relative_to(PROJECT_DIR))
+
+    entry = {
+        "promoted_at": now(),
+        "mode": mode,
+        "pool": live_pool,
+        "run": run,
+        "test_set": test_set.name,
+        "score": score_text,
+    }
+    LIVE_FILE.write_text(json.dumps(entry, indent=2) + "\n", encoding="utf-8")
+    with open(PROMOTIONS, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
+    print(f"Live pipeline now runs {run}.")
+
+
+def rollback() -> None:
+    """Go back to the version that was live before the current one."""
+    history = []
+    if PROMOTIONS.exists():
+        history = [json.loads(l) for l in PROMOTIONS.read_text().splitlines() if l.strip()]
+    promotions = [h for h in history if not h.get("rollback")]
+    current = load_live().get("run")
+    positions = [i for i, h in enumerate(promotions) if h["run"] == current]
+    if not positions or positions[-1] == 0:
+        raise RuntimeError("There is no earlier promotion to roll back to.")
+
+    previous = promotions[positions[-1] - 1]
+    LIVE_FILE.write_text(json.dumps(previous, indent=2) + "\n", encoding="utf-8")
+    with open(PROMOTIONS, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"rollback": True, "at": now(), "from": current, "to": previous["run"]})
+            + "\n"
+        )
+    print(f"Rolled back: live pipeline runs {previous['run']} again.")
+
+
+def report(test_set: Path) -> None:
+    """Print every case against every run, then accuracy and flags per run."""
+    cases = load_test_set(test_set)
+    results = load_results(test_set)
     runs = list(dict.fromkeys(r["run"] for r in results))
     if not runs:
         print("No results yet.")
         return
     latest = {(r["run"], r["case_id"]): r for r in results}
+    width = max(len(run) for run in runs) + 2
+    live = live_run()
 
     def cell(result):
         if result is None:
@@ -206,40 +340,33 @@ def report() -> None:
         flagged = " f" if result.get("flags") else ""
         return f"{p['category'][:5]} u{p['urgency']} {mark}{flagged}"
 
-    print(f"\n{'case':<5} {'expected':<12}" + "".join(f"{run:<26}" for run in runs))
+    print(f"\n{'case':<5} {'expected':<12}" + "".join(f"{run:<{width}}" for run in runs))
     for case in cases:
         expected = f"{case['category'][:5]} u{case['urgency']}"
-        cells = "".join(f"{cell(latest.get((run, case['id']))):<26}" for run in runs)
+        if case.get("needs_review"):
+            expected += " r"
+        cells = "".join(f"{cell(latest.get((run, case['id']))):<{width}}" for run in runs)
         print(f"{case['id']:<5} {expected:<12}{cells}")
 
     print()
     for run in runs:
         scored = [latest[(run, c["id"])] for c in cases if (run, c["id"]) in latest]
         n = len(scored)
-        parts = [
-            f"{f} {sum(r['correct'][f] for r in scored)}/{n}" for f in SCORED_FIELDS
-        ]
+        parts = [f"{f} {sum(r['correct'][f] for r in scored)}/{n}" for f in SCORED_FIELDS]
         both = sum(all(r["correct"].values()) for r in scored)
-        print(f"{run:<26} " + ", ".join(parts) + f", both right {both}/{n}")
+        marker = "  <- live" if run == live else ""
+        print(f"{run:<{width}} " + ", ".join(parts) + f", both right {both}/{n}{marker}")
 
-    # How good are the flags? A useful flag lands on the cases the model gets
-    # wrong and leaves the right ones alone. Older runs did not record flags.
-    flag_runs = [
-        run for run in runs
-        if all("flags" in latest[(run, c["id"])] for c in cases if (run, c["id"]) in latest)
-    ]
-    if flag_runs:
-        print("\nflags (f in the table): would the right cases have gone to review?")
-    for run in flag_runs:
+    flagged_runs = []
+    for run in runs:
         scored = [latest[(run, c["id"])] for c in cases if (run, c["id"]) in latest]
-        wrong = [r for r in scored if not all(r["correct"].values())]
-        flagged = [r for r in scored if r["flags"]]
-        caught = [r for r in flagged if not all(r["correct"].values())]
-        print(
-            f"{run:<26} flagged {len(flagged)}/{len(scored)}, caught "
-            f"{len(caught)} of {len(wrong)} mistakes, "
-            f"{len(flagged) - len(caught)} flagged cases were right"
-        )
+        stats = flag_stats(scored, cases)
+        if stats:
+            flagged_runs.append((run, stats))
+    if flagged_runs:
+        print("\nflags (f in the table; r marks cases a person should review):")
+    for run, stats in flagged_runs:
+        print(f"{run:<{width}} {describe_flags(stats)}")
 
 
 def main() -> int:
@@ -249,29 +376,40 @@ def main() -> int:
         "--pool",
         type=Path,
         default=CORRECTIONS_FILE,
-        help="Example pool for fewshot mode (default: data/corrections.jsonl)",
+        help="Example pool for modes that use examples (default: data/corrections.jsonl)",
     )
+    parser.add_argument("--test-set", type=Path, default=DEFAULT_TEST_SET)
     parser.add_argument("--dry-run", action="store_true", help="Print prompts only")
     parser.add_argument("--report", action="store_true", help="Compare saved runs")
     parser.add_argument(
-        "--gate",
-        metavar="CANDIDATE",
-        help="Decide whether CANDIDATE may replace the --against run",
+        "--gate", metavar="MODE", choices=list(PROMPT_MODES),
+        help="Decide whether MODE (with --pool) may replace the live version",
     )
     parser.add_argument(
-        "--against",
-        default=LIVE_MODE,
-        help=f"Run the candidate must beat (default: the live one, {LIVE_MODE})",
+        "--against", metavar="MODE", choices=list(PROMPT_MODES),
+        help="Compare with this mode instead of the live version (no promotion)",
     )
+    parser.add_argument(
+        "--promote", action="store_true", help="With --gate: switch if it passes"
+    )
+    parser.add_argument("--rollback", action="store_true", help="Undo the last promotion")
     args = parser.parse_args()
 
+    if args.rollback:
+        rollback()
+        return 0
     if args.mode:
-        score(args.mode, args.pool, args.dry_run)
+        score(args.mode, args.pool, args.test_set, args.dry_run)
     if args.report or (args.mode and not args.dry_run):
-        report()
+        report(args.test_set)
     if args.gate:
+        if args.promote and args.against:
+            raise RuntimeError("--promote only works against the live version.")
+        passed, run, score_text = gate(args.gate, args.pool, args.test_set, args.against)
+        if passed and args.promote:
+            promote(args.gate, args.pool, run, args.test_set, score_text)
         # Exit code 0 = promote, 1 = reject, so scripts can act on it.
-        return 0 if gate(args.gate, args.against) else 1
+        return 0 if passed else 1
     if not (args.mode or args.report):
         parser.print_help()
     return 0

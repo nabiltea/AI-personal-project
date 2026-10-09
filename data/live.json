@@ -1,0 +1,9 @@
+{
+  "promoted_at": "2026-10-07",
+  "mode": "rules-fewshot-alt",
+  "pool": "data/pools/pool-6d501de8.jsonl",
+  "run": "rules-fewshot-alt:pool-6d501de8",
+  "test_set": "test_set.json",
+  "score": "10/10 vs 9/10",
+  "note": "recorded afterwards"
+}
