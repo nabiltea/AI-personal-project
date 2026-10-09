@@ -2,7 +2,7 @@
 Capture the corrections a reviewer made on the HubSpot deal board.
 
 Flagged deals (and a random share of the rest) are sent to "Rep Review
-Required". The reviewer fixes the category or urgency if the model got them
+Required". The reviewer fixes the categories or urgency if the model got them
 wrong, then moves the deal on. This script finds the deals that were sent to
 review and have since left it, compares what the model said (from
 data/runs.jsonl) with what the reviewer kept (from HubSpot), and writes one
@@ -29,8 +29,31 @@ from enrich_lead import (
 )
 
 # The two fields the reviewer judges. The summary is free text, so there is no
-# single right answer to compare it against.
-SCORED_FIELDS = ["category", "urgency"]
+# single right answer to compare it against. "categories" is a list: an order
+# can span several (see LABELLING.md).
+SCORED_FIELDS = ["categories", "urgency"]
+
+
+def output_categories(answer: dict) -> list:
+    """The categories in a model answer or label, as a list.
+
+    Records written before multi-category support hold a single "category".
+    """
+    if answer.get("categories"):
+        return list(answer["categories"])
+    return [answer["category"]] if answer.get("category") else []
+
+
+def answers_match(field: str, ai, human) -> bool:
+    """Whether two answers for one field agree.
+
+    Categories are compared as a set: "Home, Electronics" and "Electronics,
+    Home" describe the same order. HubSpot may also show ticked checkboxes in
+    its own option order, so the order carries no meaning here.
+    """
+    if field == "categories":
+        return set(ai or []) == set(human or [])
+    return ai == human
 
 
 def load_runs() -> list:
@@ -59,9 +82,12 @@ def fetch_deals(deal_ids: list) -> dict:
         check(response, "deal batch read")
         for deal in response.json().get("results", []):
             values = deal["properties"]
+            ticked = values.get(DEAL_PROPERTIES["categories"]) or ""
             deals[deal["id"]] = {
                 "stage": values.get("dealstage"),
-                **{f: values.get(DEAL_PROPERTIES[f]) for f in SCORED_FIELDS},
+                # "Multiple checkboxes" come back as "Home;Electronics".
+                "categories": [c.strip() for c in ticked.split(";") if c.strip()],
+                "urgency": values.get(DEAL_PROPERTIES["urgency"]),
             }
     return deals
 
@@ -82,9 +108,10 @@ def build_correction(run: dict, final: dict) -> dict:
 
     run   - one line from data/runs.jsonl. The model's answer is in
             run["output"], e.g.
-            {"summary": "...", "category": "Electronics", "urgency": "2"}
+            {"summary": "...", "categories": ["Home", "Electronics"], "urgency": "2"}
+            (older runs have a single "category" instead)
     final - the deal as it is in HubSpot now, after review, e.g.
-            {"stage": "decisionmakerboughtin", "category": "Cosmetics",
+            {"stage": "decisionmakerboughtin", "categories": ["Home"],
              "urgency": "2"}
 
     A record is returned for every reviewed deal, including those where the
@@ -92,7 +119,7 @@ def build_correction(run: dict, final: dict) -> dict:
     examples of correct answers. Deals with an empty field never reach this
     function; main() sends them back for review instead.
     """
-    ai = {field: run["output"][field] for field in SCORED_FIELDS}
+    ai = {"categories": output_categories(run["output"]), "urgency": run["output"]["urgency"]}
     human = {field: final[field] for field in SCORED_FIELDS}
     return {
         "deal_id": run["deal_id"],
@@ -105,7 +132,9 @@ def build_correction(run: dict, final: dict) -> dict:
         "flags": run["flags"],
         "ai": ai,
         "human": human,
-        "corrected_fields": [f for f in SCORED_FIELDS if ai[f] != human[f]],
+        "corrected_fields": [
+            f for f in SCORED_FIELDS if not answers_match(f, ai[f], human[f])
+        ],
     }
 
 
@@ -150,7 +179,7 @@ def main() -> int:
     )
     for field in SCORED_FIELDS:
         right = sum(field not in c["corrected_fields"] for c in corrections)
-        print(f"  {field:<9} model was right on {right}/{len(corrections)}")
+        print(f"  {field:<10} model was right on {right}/{len(corrections)}")
     print(f"\nWritten to {CORRECTIONS_FILE}")
     return 0
 

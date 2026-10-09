@@ -2,10 +2,11 @@
 The learning step: find past reviewed requests that resemble a new one and
 format them as examples for the prompt.
 
-The example pool is data/corrections.jsonl: every deal a sales rep has
-reviewed, both the ones they corrected and the ones they confirmed. Showing
-only corrections would push the model in one direction (they all say "less
-urgent"); the confirmed ones keep it balanced.
+An example pool is a file of reviewed deals, both the ones a sales rep
+corrected and the ones they confirmed. Showing only corrections would push the
+model in one direction (they all say "less urgent"); the confirmed ones keep it
+balanced. New reviews collect in data/corrections.jsonl; the live pipeline uses
+a frozen copy in data/pools/ that has passed the gate in evaluate.py.
 """
 
 import json
@@ -15,6 +16,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 EXAMPLES_PER_REQUEST = 3
 
+# What v2 shows from each past review. Kept as "category" (singular) so v2's
+# prompt reads exactly as it did when it was scored.
 ALL_FIELDS = ("category", "urgency")
 
 
@@ -68,14 +71,26 @@ def format_examples(examples: list, fields: tuple = ALL_FIELDS) -> str:
             f"verdict. Use them only to judge {' and '.join(fields)}."
         )
 
+    def value(answer, field):
+        # Pools captured before multi-category support store one "category";
+        # later ones store a "categories" list. Either can be shown as either.
+        if field in ("category", "categories"):
+            found = answer.get("categories") or [answer.get("category")]
+            return ", ".join(c for c in found if c)
+        return answer[field]
+
     def describe(answer):
-        return ", ".join(f"{f} {answer[f]}" for f in fields)
+        return ", ".join(f"{f} {value(answer, f)}" for f in fields)
+
+    def corrected(example, field):
+        names = {"category", "categories"} if field in ("category", "categories") else {field}
+        return bool(names & set(example["corrected_fields"]))
 
     lines = [intro]
     for example in examples:
         lines.append(f'\nRequest: "{example["product_request"]}"')
         lines.append(f"AI answered: {describe(example['ai'])}")
-        if any(f in example["corrected_fields"] for f in fields):
+        if any(corrected(example, f) for f in fields):
             lines.append(f"Rep corrected it to: {describe(example['human'])}")
         else:
             lines.append("Rep confirmed this was correct.")

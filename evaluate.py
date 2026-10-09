@@ -8,6 +8,7 @@ Run:
     python evaluate.py --mode rules                 # v3: v1 + date + urgency rules
     python evaluate.py --mode rules-fewshot         # v4: v3 + past reviews, urgency only
     python evaluate.py --mode rules-fewshot-alt     # v5: v4 + "could it be another category?"
+    python evaluate.py --mode per-product           # v6: every product, its category and ambiguity
     python evaluate.py --mode rules --dry-run       # print the prompts, no API calls
     python evaluate.py --report                     # compare everything scored so far
     python evaluate.py --gate rules-fewshot-alt     # compare with the live version
@@ -29,8 +30,9 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from capture_corrections import SCORED_FIELDS
+from capture_corrections import SCORED_FIELDS, answers_match, output_categories
 from enrich_lead import (
+    CATEGORIES,
     CORRECTIONS_FILE,
     LIVE_FILE,
     POOLS_DIR,
@@ -66,12 +68,27 @@ def load_test_set(path: Path) -> list:
     """
     with open(path, encoding="utf-8") as handle:
         cases = json.load(handle)
-    required = list(SCORED_FIELDS) + ["received"]
-    incomplete = [c["id"] for c in cases if not all(c.get(f) for f in required)]
-    if incomplete:
-        raise RuntimeError(
-            f"These test cases are missing a label or received date: {incomplete}"
-        )
+    problems = []
+    for case in cases:
+        # The first test set was labelled with a single "category".
+        case["categories"] = output_categories(case)
+        if not case["categories"] or not case.get("urgency") or not case.get("received"):
+            problems.append(f"{case['id']}: missing a label or received date")
+            continue
+        # A typo in a label would quietly count every answer as wrong.
+        unknown = [c for c in case["categories"] if c not in CATEGORIES]
+        if unknown:
+            problems.append(f"{case['id']}: unknown categories {unknown}")
+        if case["urgency"] not in ("1", "2", "3"):
+            problems.append(f"{case['id']}: urgency must be \"1\", \"2\" or \"3\"")
+        if case.get("needs_review") not in (None, True, False):
+            problems.append(f"{case['id']}: needs_review must be true or false")
+        try:
+            date.fromisoformat(case["received"])
+        except ValueError:
+            problems.append(f"{case['id']}: received must look like 2026-10-09")
+    if problems:
+        raise RuntimeError("Fix the test set first:\n  " + "\n  ".join(problems))
     return cases
 
 
@@ -95,7 +112,7 @@ def run_name(mode: str, pool_path) -> str:
     The pool is named by its contents, so a run against yesterday's
     corrections is kept apart from one against today's.
     """
-    uses_examples = PROMPT_MODES[mode][1]
+    uses_examples = PROMPT_MODES[mode].example_fields is not None
     return f"{mode}:{pool_id(pool_path)}" if uses_examples else mode
 
 
@@ -110,6 +127,15 @@ def load_results(test_set: Path) -> list:
         return []
     with open(RESULTS, encoding="utf-8") as handle:
         records = [json.loads(line) for line in handle if line.strip()]
+    for r in records:
+        # Answers saved before multi-category support hold one "category".
+        if "category" in r["expected"]:
+            r["expected"] = {"categories": output_categories(r["expected"]), "urgency": r["expected"]["urgency"]}
+            r["predicted"] = {
+                "categories": output_categories(r["predicted"]) or None,
+                "urgency": r["predicted"]["urgency"],
+            }
+            r["correct"] = {"categories": r["correct"]["category"], "urgency": r["correct"]["urgency"]}
     return [r for r in records if r.get("test_set", DEFAULT_TEST_SET.name) == test_set.name]
 
 
@@ -120,8 +146,8 @@ def save_result(record: dict) -> None:
 
 def score(mode: str, pool_path: Path, test_set: Path, dry_run: bool) -> None:
     cases = load_test_set(test_set)
-    tell_date, use_examples, example_fields, ask_alternative = PROMPT_MODES[mode]
-    pool = load_pool(pool_path) if use_examples else []
+    m = PROMPT_MODES[mode]
+    pool = load_pool(pool_path) if m.example_fields else []
     check_no_leak(cases, pool)
 
     run = run_name(mode, pool_path)
@@ -132,21 +158,19 @@ def score(mode: str, pool_path: Path, test_set: Path, dry_run: bool) -> None:
             continue
 
         examples = find_similar(case["product_request"], pool) if pool else []
-        block = format_examples(examples, example_fields) if examples else ""
+        block = format_examples(examples, m.example_fields) if examples else ""
         received = (
-            format_received(date.fromisoformat(case["received"])) if tell_date else None
+            format_received(date.fromisoformat(case["received"])) if m.tell_date else None
         )
 
         if dry_run:
             print(f"===== {case['id']} =====")
-            print(build_prompt(case["product_request"], block, received, ask_alternative), "\n")
+            print(build_prompt(case["product_request"], m, block, received), "\n")
             continue
 
         expected = {f: case[f] for f in SCORED_FIELDS}
         try:
-            answer = enrich_with_gemini(
-                case["product_request"], block, received, ask_alternative
-            )
+            answer = enrich_with_gemini(case["product_request"], m, block, received)
             predicted = {f: answer[f] for f in SCORED_FIELDS}
             flags = answer["flags"]
             prompt_version, error = answer["prompt_version"], None
@@ -160,7 +184,7 @@ def score(mode: str, pool_path: Path, test_set: Path, dry_run: bool) -> None:
             flags = []
             prompt_version, error = None, str(failure)
 
-        correct = {f: predicted[f] == expected[f] for f in SCORED_FIELDS}
+        correct = {f: answers_match(f, predicted[f], expected[f]) for f in SCORED_FIELDS}
         save_result(
             {
                 "timestamp": now(),
@@ -238,7 +262,7 @@ def gate(mode: str, pool_path: Path, test_set: Path, against: str = None):
     """Decide whether a candidate may replace the current version.
 
     Rule: promote if the candidate gets at least as many test cases fully
-    right (category and urgency) as the current version. On a tie, it must
+    right (categories and urgency) as the current version. On a tie, it must
     also be no worse at flagging, when the test set says which cases need
     review. Returns (promote, candidate run, score text).
     """
@@ -277,7 +301,7 @@ def gate(mode: str, pool_path: Path, test_set: Path, against: str = None):
 def promote(mode: str, pool_path: Path, run: str, test_set: Path, score_text: str) -> None:
     """Make the candidate live, freezing the exact pool it was tested with."""
     live_pool = None
-    if PROMPT_MODES[mode][1]:
+    if PROMPT_MODES[mode].example_fields:
         POOLS_DIR.mkdir(parents=True, exist_ok=True)
         snapshot = POOLS_DIR / f"{pool_id(pool_path)}.jsonl"
         shutil.copyfile(pool_path, snapshot)
@@ -318,6 +342,11 @@ def rollback() -> None:
     print(f"Rolled back: live pipeline runs {previous['run']} again.")
 
 
+def short(categories) -> str:
+    """Categories as they fit in a table column: ["Home", "Electronics"] -> "Home+Elec"."""
+    return "+".join(c[:4] for c in categories) if categories else "-"
+
+
 def report(test_set: Path) -> None:
     """Print every case against every run, then accuracy and flags per run."""
     cases = load_test_set(test_set)
@@ -338,15 +367,15 @@ def report(test_set: Path) -> None:
         p = result["predicted"]
         mark = "ok" if all(result["correct"].values()) else "XX"
         flagged = " f" if result.get("flags") else ""
-        return f"{p['category'][:5]} u{p['urgency']} {mark}{flagged}"
+        return f"{short(p['categories'])} u{p['urgency']} {mark}{flagged}"
 
-    print(f"\n{'case':<5} {'expected':<12}" + "".join(f"{run:<{width}}" for run in runs))
+    print(f"\n{'case':<5} {'expected':<20}" + "".join(f"{run:<{width}}" for run in runs))
     for case in cases:
-        expected = f"{case['category'][:5]} u{case['urgency']}"
+        expected = f"{short(case['categories'])} u{case['urgency']}"
         if case.get("needs_review"):
             expected += " r"
         cells = "".join(f"{cell(latest.get((run, case['id']))):<{width}}" for run in runs)
-        print(f"{case['id']:<5} {expected:<12}{cells}")
+        print(f"{case['id']:<5} {expected:<20}{cells}")
 
     print()
     for run in runs:

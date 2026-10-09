@@ -2,8 +2,13 @@
 Inbound wholesale lead enrichment pipeline.
 
 Takes a raw wholesale inquiry (free-text product request plus contact details),
-uses Gemini to extract structured fields from the free text, then writes a
-contact and an associated deal into HubSpot.
+uses Gemini to extract a summary, urgency and the product categories from the
+free text, then writes a contact and an associated deal into HubSpot. Each
+deal starts in Stage 1 and moves on to review (Stage 2) if anything about it
+looks doubtful, or straight to outreach (Stage 3) if not.
+
+Which prompt version runs, and with which example pool, is decided by
+evaluate.py and recorded in data/live.json.
 
 Every run is appended to data/runs.jsonl (input, prompt version, raw model
 output, validated fields, flags) so later corrections can be compared against
@@ -23,6 +28,7 @@ import re
 import random
 import sys
 import time
+from collections import namedtuple
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -69,12 +75,15 @@ STAGE_OUTREACH = "decisionmakerboughtin"  # Stage 3: Active Outreach
 SPOT_CHECK_RATE = 0.2
 
 # Prompt versions, recorded on every run and deal so accuracy can be compared
-# per version (see prompt_version()). Add a new one whenever the prompt changes.
+# per version (see PROMPT_MODES below). Add one whenever the prompt changes.
 #   v1  original prompt
 #   v2  v1 + similar past reviewed requests as examples (see examples.py)
 #   v3  v1 + the date the request came in + the written urgency rules
 #   v4  v3 + similar past reviewed requests, showing urgency only
 #   v5  v4 + asks whether another category could also fit, to flag ambiguity
+#   v6  v3 + v4's examples, but the order is broken into products: each gets
+#       a category and its own ambiguity check, and the deal gets every
+#       category in the order (no "main" category any more)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_LOG = PROJECT_DIR / "data" / "runs.jsonl"
@@ -89,14 +98,23 @@ POOLS_DIR = RUN_LOG.parent / "pools"
 
 # What each prompt version is made of. evaluate.py scores these modes; the live
 # pipeline runs the one named in LIVE_FILE.
+PromptMode = namedtuple(
+    "PromptMode",
+    [
+        "version",          # recorded on every run and deal
+        "tell_date",        # include the received date and the urgency rules
+        "example_fields",   # fields past reviews show in the prompt; None = no examples
+        "ask_alternative",  # v5: ask whether the order could be another category
+        "per_product",      # v6: one category and ambiguity check per product
+    ],
+)
 PROMPT_MODES = {
-    # mode:              (tell the date?, use examples?, fields shown in
-    #                     examples, ask for a second possible category?)
-    "baseline":          (False, False, None, False),          # v1
-    "fewshot":           (False, True, ALL_FIELDS, False),     # v2
-    "rules":             (True, False, None, False),           # v3
-    "rules-fewshot":     (True, True, ("urgency",), False),    # v4
-    "rules-fewshot-alt": (True, True, ("urgency",), True),     # v5
+    "baseline":          PromptMode("v1", False, None,         False, False),
+    "fewshot":           PromptMode("v2", False, ALL_FIELDS,   False, False),
+    "rules":             PromptMode("v3", True,  None,         False, False),
+    "rules-fewshot":     PromptMode("v4", True,  ("urgency",), False, False),
+    "rules-fewshot-alt": PromptMode("v5", True,  ("urgency",), True,  False),
+    "per-product":       PromptMode("v6", True,  ("urgency",), False, True),
 }
 
 CATEGORIES = ["Cosmetics", "Electronics", "General", "Fashion", "Home"]
@@ -104,7 +122,11 @@ CATEGORIES = ["Cosmetics", "Electronics", "General", "Fashion", "Home"]
 # Requests shorter than this rarely carry enough detail to classify reliably.
 SHORT_REQUEST_WORDS = 6
 
-# HubSpot internal property names for the three enriched fields.
+# HubSpot internal property names for the enriched fields.
+#
+# The category properties are "Multiple checkboxes": an order can span several
+# categories, and HubSpot stores them separated by semicolons ("Home;Electronics").
+# Versions before v6 always give exactly one.
 #
 # Contacts and deals use different internal names here because the properties
 # were created separately as the CRM grew, which is normal in a real account.
@@ -112,13 +134,13 @@ SHORT_REQUEST_WORDS = 6
 # HubSpot portal is a config change rather than a code change.
 CONTACT_PROPERTIES = {
     "summary": "ai_research_summary",
-    "category": "product_category_fit",
+    "categories": "product_category_fit",
     "urgency": "urgency_tier",
 }
 
 DEAL_PROPERTIES = {
     "summary": "order_summary",
-    "category": "product_category",
+    "categories": "product_category",
     "urgency": "urgency_tier",
     "flags": "ai_flags",
     "prompt_version": "ai_prompt_version",
@@ -202,31 +224,47 @@ OTHER_CATEGORY_FIELD = (
     'reasonably fit this request, name it. Otherwise write none"}'
 )
 
-
-def prompt_version(
-    examples_block: str = "", received: str = None, ask_alternative: bool = False
-) -> str:
-    if ask_alternative:
-        return "v5"
-    if received:
-        return "v4" if examples_block else "v3"
-    return "v2" if examples_block else "v1"
+# v6: an order is a list of products, and each one gets its own category and
+# its own "could it also be another category?" check. A mixed order (bedsheets
+# and phones) is then simply two categories, while an ambiguous product (a
+# kettle: Home or Electronics?) is flagged, even when it sits inside a mixed
+# order. There is no "main" category, so there are no units to count or ties
+# to break.
+V3_CATEGORY_LINE = (
+    '  "category": "Pick the single best fit from this exact list: {categories}"}}'
+)
+V6_PRODUCTS_LINE = (
+    '  "products": [\n'
+    '    {{"product": "a short name for one product in the order",\n'
+    '      "category": "the best fit for this product from this exact list: {categories}",\n'
+    '      "other_category": "another category from the same list this product could also '
+    'reasonably belong to, or none"}}\n'
+    "  ]}}\n\n"
+    "List every distinct product in the order, in the order the buyer mentions them."
+)
+assert V3_CATEGORY_LINE in PROMPT_TEMPLATE_V3
+PROMPT_TEMPLATE_V6 = PROMPT_TEMPLATE_V3.replace(V3_CATEGORY_LINE, V6_PRODUCTS_LINE)
 
 
 def build_prompt(
     product_request: str,
+    mode: PromptMode = PROMPT_MODES["baseline"],
     examples_block: str = "",
     received: str = None,
-    ask_alternative: bool = False,
 ) -> str:
-    """Fill in the prompt template, optionally with a date and past examples.
+    """Fill in the prompt for one prompt version (see PROMPT_MODES).
 
-    received (e.g. "Monday 5 October 2026") switches to the v3 template with
-    the urgency rules. Examples go just before the buyer's request.
-    ask_alternative adds the v5 "other_category" field. With none of them, the
-    prompt is exactly v1, so earlier results stay comparable.
+    received (e.g. "Monday 5 October 2026") is the day the request came in, for
+    versions that are told the date. Examples go just before the buyer's
+    request. Earlier versions produce exactly the prompts they always did, so
+    their results stay comparable.
     """
-    template = PROMPT_TEMPLATE_V3 if received else PROMPT_TEMPLATE
+    if mode.per_product:
+        template = PROMPT_TEMPLATE_V6
+    elif mode.tell_date:
+        template = PROMPT_TEMPLATE_V3
+    else:
+        template = PROMPT_TEMPLATE
     prompt = template.format(
         product_request=product_request,
         categories="[" + ", ".join(CATEGORIES) + "]",
@@ -236,8 +274,8 @@ def build_prompt(
         prompt = prompt.replace(
             REQUEST_HEADING, f"{examples_block}\n\n{REQUEST_HEADING}", 1
         )
-    if ask_alternative:
-        # The template ends with the closing brace of the JSON description.
+    if mode.ask_alternative:
+        # The v3 template ends with the closing brace of the JSON description.
         prompt = prompt[: prompt.rindex("}")] + OTHER_CATEGORY_FIELD
     return prompt
 
@@ -252,8 +290,16 @@ def strip_code_fences(text: str) -> str:
     return cleaned.replace("```", "").strip()
 
 
+def match_category(value) -> str:
+    """The allowed category this value names, or None ("home" -> "Home")."""
+    text = str(value).strip().lower()
+    return next((c for c in CATEGORIES if c.lower() == text), None)
+
+
 def validate_enrichment(
-    data: dict, product_request: str = "", ask_alternative: bool = False
+    data: dict,
+    product_request: str = "",
+    mode: PromptMode = PROMPT_MODES["baseline"],
 ) -> dict:
     """Coerce the model's output into something safe to write to a CRM.
 
@@ -281,30 +327,22 @@ def validate_enrichment(
         urgency = "2"
         flags.append(f"urgency_fallback:{raw_urgency or 'missing'}")
 
-    raw_category = str(data.get("category", "")).strip()
-    match = next(
-        (c for c in CATEGORIES if c.lower() == raw_category.lower()), None
-    )
-    if match is None:
-        category = "General"
-        flags.append(f"category_fallback:{raw_category or 'missing'}")
+    # Every version ends up with a list of categories: one for v1-v5, one per
+    # distinct product category for v6 (in the order the buyer mentions them).
+    products = None
+    if mode.per_product:
+        categories, products = check_products(data.get("products"), flags)
     else:
-        category = match
-        if category == "General":
-            # The model choosing the catch-all usually means it was unsure.
-            flags.append("general_category")
+        categories = [check_category(data.get("category", ""), flags)]
 
     if len(product_request.split()) < SHORT_REQUEST_WORDS:
         flags.append("short_request")
 
     other_category = None
-    if ask_alternative:
-        raw_other = str(data.get("other_category", "")).strip()
-        other_category = next(
-            (c for c in CATEGORIES if c.lower() == raw_other.lower()), None
-        )
+    if mode.ask_alternative:
+        other_category = match_category(data.get("other_category", ""))
         # "none", an invented category or the same one again mean no doubt.
-        if other_category == category:
+        if other_category in categories:
             other_category = None
         if other_category:
             flags.append(f"ambiguous_category:{other_category}")
@@ -312,10 +350,52 @@ def validate_enrichment(
     return {
         "summary": summary,
         "urgency": urgency,
-        "category": category,
+        "categories": categories,
+        "products": products,
         "other_category": other_category,
         "flags": flags,
     }
+
+
+def check_category(raw, flags: list, product: str = None) -> str:
+    """One category from the allowed list, falling back to General with a flag."""
+    match = match_category(raw)
+    if match is None:
+        where = f"{product}: " if product else ""
+        flags.append(f"category_fallback:{where}{str(raw).strip() or 'missing'}")
+        return "General"
+    if match == "General" and "general_category" not in flags:
+        # The model choosing the catch-all usually means it was unsure.
+        flags.append("general_category")
+    return match
+
+
+def check_products(raw, flags: list) -> tuple:
+    """v6: a category and an ambiguity check for each product in the order.
+
+    Returns (categories, products). A product that could reasonably belong to
+    another category is flagged by name, so the reviewer knows exactly what to
+    decide: "ambiguous:kettles (Home or Electronics)". A mixed order on its own
+    is not flagged; it simply has more than one category.
+    """
+    items = [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    if not items:
+        flags.append("category_fallback:no products listed")
+        return ["General"], []
+
+    categories, products = [], []
+    for item in items:
+        name = str(item.get("product", "")).strip() or "unnamed product"
+        category = check_category(item.get("category", ""), flags, name)
+        other = match_category(item.get("other_category", ""))
+        if other == category:
+            other = None
+        if other:
+            flags.append(f"ambiguous:{name} ({category} or {other})")
+        products.append({"product": name, "category": category, "other_category": other})
+        if category not in categories:
+            categories.append(category)
+    return categories, products
 
 
 class QuotaExhausted(RuntimeError):
@@ -339,20 +419,20 @@ def retry_delay_seconds(response: requests.Response) -> int:
 
 def enrich_with_gemini(
     product_request: str,
+    mode: PromptMode = PROMPT_MODES["baseline"],
     examples_block: str = "",
     received: str = None,
-    ask_alternative: bool = False,
 ) -> dict:
     """Send the free-text request to Gemini and return validated fields.
 
     The raw model text is kept alongside the validated fields so the run log
     shows what the model actually said, not just what survived validation.
-    The keyword arguments select the prompt version (see build_prompt).
+    mode is the prompt version (see PROMPT_MODES and build_prompt).
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set. See .env.example.")
 
-    prompt = build_prompt(product_request, examples_block, received, ask_alternative)
+    prompt = build_prompt(product_request, mode, examples_block, received)
     for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
         response = requests.post(
             GEMINI_URL,
@@ -400,12 +480,15 @@ def enrich_with_gemini(
     except ValueError:
         # Show what came back; a bare JSON error hides the actual cause.
         raise RuntimeError(f"Gemini did not return valid JSON: {raw_text[:300]!r}")
-    enrichment = validate_enrichment(parsed, product_request, ask_alternative)
+    enrichment = validate_enrichment(parsed, product_request, mode)
     enrichment["raw_output"] = raw_text
-    enrichment["prompt_version"] = prompt_version(
-        examples_block, received, ask_alternative
-    )
+    enrichment["prompt_version"] = mode.version
     return enrichment
+
+
+def hubspot_multi(values: list) -> str:
+    """A "Multiple checkboxes" value as HubSpot stores it: "Home;Electronics"."""
+    return ";".join(values)
 
 
 def hubspot_headers() -> dict:
@@ -485,7 +568,7 @@ def upsert_contact(submission: dict, enrichment: dict) -> str:
         "lastname": submission["last_name"],
         "company": submission["company_name"],
         CONTACT_PROPERTIES["summary"]: enrichment["summary"],
-        CONTACT_PROPERTIES["category"]: enrichment["category"],
+        CONTACT_PROPERTIES["categories"]: hubspot_multi(enrichment["categories"]),
         CONTACT_PROPERTIES["urgency"]: enrichment["urgency"],
     }
 
@@ -524,7 +607,7 @@ def create_deal(submission: dict, enrichment: dict) -> str:
                 # against the source. The AI summary lives in order_summary.
                 "description": submission["product_request"],
                 DEAL_PROPERTIES["summary"]: enrichment["summary"],
-                DEAL_PROPERTIES["category"]: enrichment["category"],
+                DEAL_PROPERTIES["categories"]: hubspot_multi(enrichment["categories"]),
                 DEAL_PROPERTIES["urgency"]: enrichment["urgency"],
                 DEAL_PROPERTIES["flags"]: ", ".join(enrichment["flags"]),
                 DEAL_PROPERTIES["prompt_version"]: enrichment["prompt_version"],
@@ -602,7 +685,9 @@ def log_run(
         "output": {
             "summary": enrichment["summary"],
             "urgency": enrichment["urgency"],
-            "category": enrichment["category"],
+            "categories": enrichment["categories"],
+            # v6 only: each product with its category and possible alternative.
+            "products": enrichment.get("products"),
             "other_category": enrichment.get("other_category"),
         },
         "flags": enrichment["flags"],
@@ -623,14 +708,14 @@ def live_prompt_inputs(product_request: str, received: date) -> tuple:
     with them has passed, so a batch of bad reviews can't slip in unchecked.
     """
     live = load_live()
-    tell_date, use_examples, example_fields, ask_alternative = PROMPT_MODES[live["mode"]]
+    mode = PROMPT_MODES[live["mode"]]
     pool_path = live_pool_path(live)
     examples = []
-    if use_examples and pool_path and pool_path.exists():
+    if mode.example_fields and pool_path and pool_path.exists():
         examples = find_similar(product_request, load_pool(pool_path))
-    block = format_examples(examples, example_fields) if examples else ""
-    received_text = format_received(received) if tell_date else None
-    return examples, block, received_text, ask_alternative
+    block = format_examples(examples, mode.example_fields) if examples else ""
+    received_text = format_received(received) if mode.tell_date else None
+    return examples, block, received_text, mode
 
 
 def process_submission(submission: dict, received: date = None) -> dict:
@@ -641,11 +726,11 @@ def process_submission(submission: dict, received: date = None) -> dict:
     file path cannot drift apart.
     """
     received = received or date.today()
-    examples, block, received_text, ask_alternative = live_prompt_inputs(
+    examples, block, received_text, mode = live_prompt_inputs(
         submission["product_request"], received
     )
     enrichment = enrich_with_gemini(
-        submission["product_request"], block, received_text, ask_alternative
+        submission["product_request"], mode, block, received_text
     )
     # Decided before the deal is created so a spot-check shows in AI Flags.
     next_stage, enrichment["flags"] = route(enrichment["flags"])
@@ -708,7 +793,7 @@ def main() -> int:
         print(f"Processing inquiry from {submission['company_name']} ({path})...")
 
         if args.dry_run:
-            _, block, received_text, ask_alternative = live_prompt_inputs(
+            _, block, received_text, mode = live_prompt_inputs(
                 submission["product_request"], received
             )
             live = load_live()
@@ -719,9 +804,7 @@ def main() -> int:
             print("Prompt that would be sent to Gemini:")
             print("-" * 60)
             print(
-                build_prompt(
-                    submission["product_request"], block, received_text, ask_alternative
-                )
+                build_prompt(submission["product_request"], mode, block, received_text)
             )
             print("-" * 60 + "\n")
             continue
@@ -739,7 +822,7 @@ def main() -> int:
         flags = ", ".join(enrichment["flags"]) or "none"
         where = "Stage 2 (review)" if result["sent_to_review"] else "Stage 3 (outreach)"
         print(
-            f"  {enrichment['category']} / urgency {enrichment['urgency']} "
+            f"  {', '.join(enrichment['categories'])} / urgency {enrichment['urgency']} "
             f"-> deal {result['deal_id']} -> {where} (flags: {flags})\n"
         )
 

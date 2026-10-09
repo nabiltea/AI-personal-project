@@ -262,7 +262,7 @@ def main() -> int:
         flags = ", ".join(enrichment["flags"]) or "none"
         where = "Stage 2 (review)" if result["sent_to_review"] else "Stage 3 (outreach)"
         print(
-            f"  done. {enrichment['category']} / urgency "
+            f"  done. {', '.join(enrichment['categories'])} / urgency "
             f"{enrichment['urgency']} -> deal {deal_id} -> {where} (flags: {flags})"
         )
         processed_count += 1
