@@ -1,176 +1,254 @@
-# Inbound Lead Enrichment Pipeline
+# Inbound Lead Triage Pipeline
 
-A buyer fills in a form and describes what they want in their own words. This
-project reads that text with Gemini, works out the product category and how
-urgent the order is, and creates a contact and a deal in HubSpot, so a sales rep
-opens the deal board to a triaged request instead of a paragraph of prose.
+Wholesale buyers describe what they want in their own words: "We're kitting out
+a staff flat, 10 bedsheet sets, 10 towels and 4 smartphones, within two weeks."
+Someone then has to read every one of these, work out which product lines it
+touches, decide how urgent it is and type it into the CRM. This project does
+that step. It reads each request with Gemini, splits the order into products,
+assigns every product a category, works out the urgency from the buyer's
+deadline, and creates the contact and deal in HubSpot.
 
-The second half of the project is about what happens after that. A rep checks
-every deal and fixes whatever the model got wrong, and those fixes are fed back
-into the prompt as examples. An evaluation on a hand-labelled test set decides
-whether a new prompt version is allowed to replace the one that's running.
+What makes it more than a form-to-CRM script is what happens next. The model
+is told to say when it isn't sure, and only those deals go to a sales rep for
+review. The rep's corrections are captured automatically and used to improve
+the prompt. Every change, whether a new prompt version or a new batch of
+corrections, has to prove itself on a hand-labelled test set before it reaches
+live deals, and any change can be rolled back.
 
-## The basic pipeline
+On the most recent test set of 18 deliberately awkward requests, the current
+version got every category right, 16 of 18 requests fully right, and flagged
+both of its mistakes for review, while sending 39% of deals to review instead
+of all of them.
+
+## What it does
 
 ```
-Google Form ──▶ responses sheet ──▶ Gemini 2.5 Flash ──▶ checks and flags ──▶ HubSpot
-                                                                    (contact + deal in "Rep Review Required")
+Google Form ──▶ responses sheet ──▶ Gemini ──▶ checks and flags ──▶ HubSpot deal
+                                                                    Stage 1: New Inbound Request
+                                                                         │
+                                              ┌──────────────────────────┴──────────────────────┐
+                                  flagged, or picked for a spot-check                   everything else
+                                              │                                                 │
+                                  Stage 2: Rep Review Required                   Stage 3: Active Outreach
 ```
 
-For each new row in the responses sheet, `process_sheet.py`:
+For each new form response, the pipeline:
 
-1. sends the free-text request to Gemini, which returns JSON with a one-line
-   summary, an urgency tier from 1 to 3 and a category from a fixed list
-2. checks that output and records a flag for anything it had to repair
-3. creates or updates the contact in HubSpot, creates a deal and links the two
-4. writes the deal id back into the sheet so the row is never processed twice
-5. appends the whole run to `data/runs.jsonl`
+1. sends the buyer's text to Gemini along with the date the request came in,
+   the urgency rules and a few similar past reviews as examples
+2. gets back a one-line summary, an urgency tier from 1 to 3, and a list of the
+   products in the order, each with a category and a note on whether it could
+   reasonably belong to another one
+3. checks the answer, repairs anything malformed and records a flag for
+   anything doubtful
+4. creates or updates the contact, creates the deal in Stage 1 and links the two
+5. moves the deal to review if it has a flag (plus a random 20% of the rest as
+   spot-checks), or straight to outreach if not
+6. logs the whole run, including the model's exact reply
 
-`enrich_lead.py` runs exactly the same steps, but takes submissions saved as
-JSON files instead of reading them from the sheet. That's how I ran the 20 test
-submissions in `submissions/train/` without typing each one into the form.
+An order can span several categories. The deal's Product Category field is a
+multiple-checkbox property, so "10 bedsheet sets, 10 towels and 4 smartphones"
+becomes Home and Electronics. The buyer's original text goes into the deal
+description, so the rep can always see what was actually asked for.
 
-## Learning from the rep's corrections
+### What sends a deal to review
 
-Every new deal lands in a "Rep Review Required" stage. The deal description
-holds the buyer's original text, so the rep can read it next to the category and
-urgency the model picked. If either is wrong they change it, and then they move
-the deal on to the next stage whether they changed anything or not. The rep
-doesn't fill in anything extra. The edit they make in the CRM is the feedback.
+| Flag | Example | Why |
+| --- | --- | --- |
+| Ambiguous product | `ambiguous:air fryers (Electronics or Home)` | The product could reasonably belong to two categories |
+| Vague timing | `ambiguous_urgency:2 or 1` | "For a corporate event next month" could fit two urgency tiers |
+| Repaired answer | `category_fallback:drones: Gadgets` | The model's answer had to be fixed before it could go into the CRM |
+| Catch-all or thin request | `general_category`, `short_request` | Usually means the model had little to go on |
+| Spot-check | `spot_check` | Picked at random so mistakes the flags miss still get found |
 
-From there:
+The flags name the product or the two tiers in question, so the rep knows
+exactly what to decide instead of rereading the whole order.
 
-- `capture_corrections.py` looks at every deal that has left the review stage,
-  compares HubSpot's final values with what the model originally said (taken
-  from the run log) and writes one record per deal to `data/corrections.jsonl`.
-  Deals the model got right are kept as well. If a reviewed field has been left
-  empty, the deal is moved back to review instead of being counted as a
-  correction.
-- `examples.py` finds the three past requests most similar to a new one, using
-  TF-IDF over the request text, and formats them for the prompt with what the
-  AI first said and what the rep decided.
-- `evaluate.py` scores a prompt version against 10 test cases that I labelled by
-  hand and kept out of the example pool. Each answer is saved as soon as it
-  comes back, so running out of quota halfway through doesn't lose anything.
-- `evaluate.py --gate` compares a candidate version with the one that's live
-  and only says PROMOTE if the candidate gets at least as many test cases fully
-  right. Promoting means changing `LIVE_MODE` in `enrich_lead.py`.
+## How it gets better over time
 
-The rules for what counts as the right answer (what urgency 3 means, what to do
-with mixed orders and so on) are in [LABELLING.md](LABELLING.md). I wrote them
-before reviewing anything, because inconsistent corrections would teach the
-model contradictory things.
+```
+reps correct deals in HubSpot
+        │
+        ▼
+capture_corrections.py ──▶ candidate example pool (data/corrections.jsonl)
+                                     │
+                                     ▼
+              evaluate.py scores it on a hand-labelled test set
+                                     │
+                                     ▼
+          the gate compares it with the live version ──▶ promote or reject
+                                     │
+                                     ▼
+         live version + frozen copy of the pool it was tested with
+```
 
-### Why every deal goes to review for now
+When a rep fixes a category or an urgency and moves the deal on, nothing extra
+is asked of them. The edit itself is the feedback. `capture_corrections.py`
+compares what the model originally said (from the run log) with what the rep
+kept (from HubSpot) and records both, whether the model was right or not. If a
+field was left empty by accident, the deal goes back to review instead of being
+counted as a correction.
 
-The original plan was for new deals to land in Stage 1 (New Inbound Request)
-and only the doubtful ones to go to Rep Review. For now everything goes to
-review, for two reasons.
+Those records become the examples shown to the model for similar requests, but
+not straight away. New corrections collect in a candidate pool, and they only
+reach live deals once an evaluation run with them has passed the gate. A
+careless batch of reviews can't quietly make the system worse. The live
+version and its frozen pool are recorded in `data/live.json`, every promotion
+is logged in `data/promotions.jsonl`, and `--rollback` undoes the last one.
+At any point you can say which prompt and which corrections were live, and why.
 
-Accuracy can only be measured on deals someone has checked. If only flagged
-deals were checked, I'd only ever find out about the mistakes the flags already
-catch, and the learning loop would never see the rest.
+The gate's rule is simple: a candidate is promoted if it gets at least as many
+test cases fully right as the live version. On a tie it also has to be at
+least as good at flagging the cases that should be reviewed.
 
-The flags also aren't good enough yet. Of the four deals I had to correct, only
-one had a flag on it, and three of the four flagged deals turned out to be fine.
-The flags catch formatting problems, but the real mistakes were about deadlines.
-Routing on flags alone would have let three of the four mistakes straight
-through.
+## How I tested it
 
-Once there's a signal that actually predicts mistakes (for example a deadline
-close to the one-week or one-month boundary), the plan is to send only those
-deals to review and the rest to Stage 1, along with a small random share of the
-confident ones so there's always a check on what the flags miss.
+The rules for what counts as the right answer are written down in
+[LABELLING.md](LABELLING.md): the urgency thresholds, what to do with mixed
+orders, which products are known to be borderline, and when a case should be
+reviewed. I wrote them before reviewing anything, and every label in the
+project follows them.
 
-## Results
+I first pushed 20 deliberately messy submissions through the pipeline (typos,
+Dutch, vague deadlines, a two-word request, a prompt-injection attempt) and
+reviewed the resulting deals myself. That gave 19 reviewed deals to learn
+from. The model had the category right on all 19 but the urgency right on only
+15, and every urgency mistake went the same way: one level too urgent.
 
-When I reviewed the first 19 deals, the model had the category right every time
-(19/19) but the urgency right only 15 times. All four urgency mistakes went the
-same way: it rated the order one level more urgent than it was.
+I then labelled two test sets by hand and kept them away from the examples the
+model sees:
 
-I then tried four prompt versions on the test set:
+- Test set 1, 10 single-category requests, used to compare v1 to v5
+- Test set 2, 18 harder requests with mixed orders and ambiguous products,
+  each also labelled with whether a person should review it
 
-| Version | What's in the prompt                                       | Category | Urgency | Both right |
-| ------- | ---------------------------------------------------------- | -------- | ------- | ---------- |
-| v1      | the original prompt                                        | 9/10     | 7/10    | 6/10       |
-| v2      | v1 plus 3 similar past corrections                         | 8/10     | 6/10    | 5/10       |
-| v3      | v1 plus the date the request came in and the urgency rules | 8/10     | 10/10   | 8/10       |
-| v4      | v3 plus 3 similar past corrections, urgency only           | 9/10     | 10/10   | 9/10       |
+### Results
 
-Adding past corrections on their own (v2) made things slightly worse. One test
-case asked for 25 yoga blocks, and one of the examples it was shown was an order
-for yoga mats and leggings. That order counts as Fashion under my rules because
-there were more leggings than mats. The model took away "yoga means Fashion" and
-got the new one wrong. My correction was fine; it was retrieved for the wrong
-reason. The gate rejected v2, which is what I'd want it to do.
+Test set 1:
 
-Most of the urgency mistakes turned out to be about dates. The prompt never said
-what day it was, so the model had no way of turning "by mid-November" or "for
-Black Friday" into a number of days. v3 adds the date the request was received
-and the thresholds from LABELLING.md, and that fixed every urgency mistake in
-the test set. So the biggest improvement came from telling the model something
-it couldn't have known, rather than from the feedback loop.
+| Version | What changed | Categories | Urgency | Fully right |
+| --- | --- | --- | --- | --- |
+| v1 | the original prompt | 9/10 | 7/10 | 6/10 |
+| v2 | plus the 3 most similar past reviews as examples | 8/10 | 6/10 | 5/10 |
+| v3 | v1 plus the date and the written urgency rules | 8/10 | 10/10 | 8/10 |
+| v4 | v3 plus past reviews, showing only their urgency | 9/10 | 10/10 | 9/10 |
+| v5 | v4 plus "could this be another category?" | 10/10 | 10/10 | 10/10 |
 
-v4 brings the corrections back but only shows their urgency, so the model can't
-copy a category from a loosely related request. It scored 9/10, passed the gate
-and is what the pipeline runs now. Its one-point lead over v3 comes down to the
-yoga blocks case, which gave a different answer under every prompt version, so
-I wouldn't read much into that point.
+Test set 2:
 
-Ten test cases is a small set. One case moves accuracy by ten points, and I
-designed v3 after looking at where v1 and v2 went wrong, so the test set isn't
-as unseen as it was at the start. v3 only uses rules I had written before the
-test set existed, but the proper next step is to check v4 on a fresh and bigger set.
+| Version | What changed | Categories | Urgency | Fully right | Sent to review | Mistakes flagged |
+| --- | --- | --- | --- | --- | --- | --- |
+| v6 | orders split into products, each with its own category and ambiguity check | 12/13 | 12/13 | 11/13 | 77% | 1 of 2 |
+| v7 | General only as a genuine doubt, "no rush" means urgency 1, a check for vague timing | 18/18 | 16/18 | 16/18 | 39% | 2 of 2 |
+
+v6 was only scored on 13 of the 18 cases. The free Gemini tier allows 20
+requests a day, and an outage on Google's side took out part of that day's run.
+
+### What the results taught me
+
+The biggest gain came from information the model was missing. Most early
+urgency mistakes were about dates. The prompt never said what day it was, so
+"by mid-November" or "for Black Friday" couldn't be turned into a number of
+days. Adding the date and the urgency rules (v3) fixed every urgency mistake on
+test set 1. The learning loop only helped once that was in place.
+
+Good feedback can still teach the wrong lesson. In v2, a request for 25 yoga
+blocks was shown a past order of yoga mats and leggings, which was Fashion
+because there were more leggings than mats. The model took away "yoga means
+Fashion" and got it wrong. The correction was right, it was just retrieved for
+the wrong reason. Since v4 the examples only show urgency, so a category can't
+be copied from a loosely related request. The gate rejected v2, which is
+exactly what it's there for.
+
+A catch-all category creates noise. v6 suggested "General" as a possible
+second category for most products, because technically anything could be
+General. That sent 77% of deals to review. v7 asks for General only when the
+model genuinely can't place a product, and review load dropped to 39%.
+
+Flagging is a trade-off between workload and caution. v6 caught every case I
+wanted reviewed but buried them in false alarms. v7 caught both of its own
+mistakes and 5 of the 8 cases I'd marked for review, at half the workload. The
+three it missed (towels twice, and candles with reed diffusers) were all put in
+the right category, so nothing went wrong, but the doubt wasn't raised. Where
+exactly to draw that line is a business decision, which is why
+[LABELLING.md](LABELLING.md) keeps a list of known borderline products.
+
+The same request doesn't always get the same answer. Even at temperature 0,
+`gemini-2.5-flash` classified one mixed order as Fashion on one run and
+Cosmetics on the next. Both runs flagged it, so it reached review either way,
+but it's a reminder that one good run doesn't prove a version is reliable.
+
+## Why I think it's useful
+
+A distributor using this gets triaged, structured deals instead of a pile of
+emails, and their reps only need to look closely at the deals the system isn't
+sure about. On the latest test set that was fewer than half, and every mistake
+was among them. The reps don't have to fill in anything extra: correcting the
+CRM, which they'd do anyway, is what teaches the system.
+
+It also doesn't depend on the business having a perfect product catalogue.
+New or unusual products get flagged as ambiguous rather than guessed silently,
+which suits smaller companies whose range changes all the time. A company that
+does have a detailed catalogue can still benefit, because some products
+genuinely belong to more than one category however carefully the categories
+are defined.
+
+Most importantly, it's built so that improving it can't quietly make it worse.
+Every change is measured on the same hand-labelled cases, compared with what's
+live, and kept or rejected on that basis, with a record of every decision.
 
 ## Decisions along the way
 
-The prompt asks for a fixed JSON shape, a category from a fixed list and an
-urgency tier with each level defined. Free-form answers would leave the CRM
-fields impossible to filter on.
+The prompt asks for a fixed JSON shape, categories from a fixed list and an
+urgency tier with each level defined. Free-form answers would make the CRM
+fields impossible to filter on. Gemini often wraps its JSON in markdown fences
+even when told not to, so those are stripped before parsing. If it returns
+something that can be repaired, like an urgency of "high" or a category that
+isn't on the list, the value falls back to a safe default and a flag records
+it. My first version repaired these silently, which made a bad answer look just
+as confident as a good one.
 
-Gemini often wraps its JSON in markdown fences even when told not to, so they're
-stripped before parsing. If it gets something wrong in a way that can be
-repaired, like an urgency of "high" or a category that isn't on the list, the
-value falls back to a default and a flag goes into the deal's AI Flags property.
-My first version repaired these silently, which made a bad answer look just as
-confident as a good one.
+Each version asks the model concrete questions ("could this product also be
+another category?", "could this timing fit another tier?") rather than asking
+how confident it is. Models are poor at putting a number on their own
+confidence, but answer the concrete version well, and the answer tells the rep
+what to check.
+
+Every deal is created in Stage 1 and then moved on, rather than created
+straight in Stage 2 or 3. HubSpot keeps each deal's stage history, so it's
+always visible that a deal went through intake first. The spot-check rate
+starts at 20%. While there's little evidence that unflagged deals are reliable,
+it's worth checking more of them. The rate is one setting and can come down
+once spot-checks keep coming back clean.
 
 Contacts are matched by email, because people submit the form twice. Sheet
 columns are found by their header text, so reordering the form's questions
 doesn't shift every field along by one. A row that fails isn't marked as
-processed, so the next run picks it up again.
+processed, so the next run picks it up again. Temperature is 0 to keep answers
+as stable as possible, although it reduces variation rather than removing it.
 
-Temperature, the setting that controls how much randomness goes into the
-model's answer, is 0. Two identical requests shouldn't be triaged differently,
-and it keeps the evaluation fair: when two prompt versions score differently,
-the difference comes from the prompt and not from chance.
+Similar past reviews are found with TF-IDF over the request text, without a
+stop-word list: scikit-learn's English stop words include "within", "next", "by"
+and "no", which are exactly the words that describe a deadline. I also tried
+ignoring numbers, since "25 yoga blocks" was being matched with "25 hair
+dryers" purely because of the 25. The only way to judge that change was to look
+at which examples the test cases got, and tuning a system until its test cases
+look good makes the test meaningless, so I left it alone.
 
-Every run is logged with the raw model output and the prompt version. Without
-that log there'd be nothing to compare against, since HubSpot only keeps the
-current value once a rep edits a deal. The corrections file works the other way
-round: it's rebuilt from scratch on every run, because HubSpot holds the rep's
-latest decision and they might change their mind.
+The evaluation is built to be repeatable. Each test case stores the date it was
+labelled against, because "before the 20th" is urgency 2 on 5 October and
+urgency 3 a week later. Example pools are named by a fingerprint of their
+contents, so a run against yesterday's corrections can't be mixed up with one
+against today's. Every new version changes as little as possible, and the
+earlier versions' prompts are checked to stay identical, so a change in score
+can be traced to the exact sentence that caused it.
 
-For similarity I used TF-IDF without a stop-word list. scikit-learn's English
-stop words include "within", "next", "by" and "no", which are exactly the words
-that describe a deadline.
-
-I also tried a version that ignored numbers, since "25 yoga blocks" was being
-matched with "25 hair dryers" purely because of the 25. The only way to judge
-whether that was better was to look at which examples the test cases got, and
-adjusting the system until the test cases look good makes the test score
-meaningless. So I kept the original and left the retrieval alone.
-
-Each test case stores the date it was labelled against. If the evaluation used
-today's date, the right answers would quietly change over time ("before the
-20th" is urgency 2 on 5 October and urgency 3 a week later), and scores from
-different days couldn't be compared. In the live pipeline the date comes from
-the form's timestamp.
-
-The free Gemini tier allows 20 requests per day per model, and that shaped a lot
-of this. The script waits and retries when it hits the per-minute limit, and
-stops straight away when the daily one runs out. The evaluation skips cases it
-has already scored, so no request is ever spent twice on the same answer.
+The free Gemini tier allows 20 requests a day per model, which shaped a lot of
+this. The pipeline waits and retries when it hits the per-minute limit or when
+Google's servers are briefly unavailable, and stops straight away when the
+daily limit runs out. The evaluation saves each answer the moment it arrives,
+skips cases it has already scored, and doesn't count an outage on Google's side
+as a wrong answer.
 
 ## Running it
 
@@ -192,41 +270,41 @@ cp .env.example .env            # then fill in your keys
   and write access to contacts and deals (`crm.objects.contacts.read`,
   `crm.objects.contacts.write`, `crm.objects.deals.read`,
   `crm.objects.deals.write`)
-- `SPREADSHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_FILE` and `SHEET_NAME`, only if you
-  use the Google Sheets path
+- `SPREADSHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_FILE` and `SHEET_NAME`, if you use
+  the Google Sheets path
 
 ### HubSpot
 
-The script writes custom properties that a new HubSpot account won't have.
-Create them under Settings → Properties. Contacts and deals use different
-internal names because I created them at different times; both mappings are at
-the top of `enrich_lead.py`.
+Create these custom properties under Settings → Properties. Contacts and deals
+use different internal names because I created them at different times; both
+mappings are at the top of `enrich_lead.py`.
 
 Contact properties:
 
-| Internal name          | Type            |
-| ---------------------- | --------------- |
-| `ai_research_summary`  | Multi-line text |
-| `product_category_fit` | Dropdown select |
-| `urgency_tier`         | Dropdown select |
+| Internal name          | Type                |
+| ---------------------- | ------------------- |
+| `ai_research_summary`  | Multi-line text     |
+| `product_category_fit` | Multiple checkboxes |
+| `urgency_tier`         | Dropdown select     |
 
 Deal properties:
 
-| Internal name       | Type             |
-| ------------------- | ---------------- |
-| `order_summary`     | Multi-line text  |
-| `product_category`  | Dropdown select  |
-| `urgency_tier`      | Dropdown select  |
-| `ai_flags`          | Single-line text |
-| `ai_prompt_version` | Single-line text |
+| Internal name       | Type                |
+| ------------------- | ------------------- |
+| `order_summary`     | Multi-line text     |
+| `product_category`  | Multiple checkboxes |
+| `urgency_tier`      | Dropdown select     |
+| `ai_flags`          | Single-line text    |
+| `ai_prompt_version` | Single-line text    |
 
-The category dropdowns need the options listed in `CATEGORIES`, including
-`General`, and the urgency dropdowns need the internal values `1`, `2` and `3`.
-The buyer's original text goes into the standard deal description field.
+The category properties need the options listed in `CATEGORIES` (Cosmetics,
+Electronics, General, Fashion, Home), and the urgency dropdowns need the
+internal values `1`, `2` and `3`.
 
-New deals go to the stage in `DEAL_STAGE`. HubSpot keeps a stage's original
-internal id when you rename it (my "Rep Review Required" stage is
-`presentationscheduled`), so look yours up with:
+The pipeline uses three stages of the default deal pipeline, set at the top of
+`enrich_lead.py` as `STAGE_NEW`, `STAGE_REVIEW` and `STAGE_OUTREACH`. HubSpot
+keeps a stage's original internal id when you rename it (my "Rep Review
+Required" stage is `presentationscheduled`), so look yours up with:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" https://api.hubapi.com/crm/v3/pipelines/deals
@@ -237,17 +315,15 @@ curl -H "Authorization: Bearer YOUR_TOKEN" https://api.hubapi.com/crm/v3/pipelin
 `process_sheet.py` needs a Google service account with the Sheets API enabled.
 Save its key as `service_account.json` in the project folder (it's gitignored)
 and share the responses sheet with the service account's email address as an
-Editor. Add a column headed `Processed` after the form's own columns; the script
-writes the deal id there.
-
-The form's timestamp is read as day/month/year, which is what a sheet with a UK
-locale produces. If your sheet uses a different locale, change
-`TIMESTAMP_FORMAT` in `process_sheet.py`.
+Editor. Add a column headed `Processed` after the form's own columns; the
+script writes the deal id there. The form's timestamp is read as
+day/month/year, which is what a sheet with a UK locale produces; change
+`TIMESTAMP_FORMAT` in `process_sheet.py` if yours differs.
 
 ### Commands
 
 ```bash
-# New form responses, or submissions saved as JSON files
+# Process new form responses, or submissions saved as JSON files
 python process_sheet.py --dry-run
 python process_sheet.py
 python enrich_lead.py submissions/train/*.json
@@ -255,10 +331,14 @@ python enrich_lead.py submissions/train/*.json
 # After reviewing deals on the board
 python capture_corrections.py
 
-# Score a prompt version, compare all versions, decide on promotion
-python evaluate.py --mode rules-fewshot
-python evaluate.py --report
-python evaluate.py --gate rules-fewshot
+# Score a version, compare everything scored so far
+python evaluate.py --mode per-product-careful
+python evaluate.py --mode per-product-careful --test-set data/test_set_2.json
+python evaluate.py --report --test-set data/test_set_2.json
+
+# Let the gate decide, and undo if needed
+python evaluate.py --gate per-product-careful --promote
+python evaluate.py --rollback
 ```
 
 `--dry-run` on `enrich_lead.py` and `evaluate.py` prints the prompts without
@@ -267,50 +347,58 @@ day.
 
 ### What's in the repo
 
-| Path                       | Purpose                                                    |
-| -------------------------- | ---------------------------------------------------------- |
-| `enrich_lead.py`           | Prompts, the Gemini call, checks, HubSpot writes, run log  |
-| `process_sheet.py`         | Reads new rows from the form's responses sheet             |
-| `capture_corrections.py`   | Turns reviewed deals into correction records               |
-| `examples.py`              | Finds and formats similar past corrections                 |
-| `evaluate.py`              | Test set scoring, the comparison report and the gate       |
-| `LABELLING.md`             | The rules behind every correction and test label           |
-| `submissions/train/`       | 20 deliberately messy submissions used for the first round |
-| `data/runs.jsonl`          | Every pipeline run                                         |
-| `data/corrections.jsonl`   | Every reviewed deal, the model's answer next to the rep's  |
-| `data/test_set.json`       | The 10 hand-labelled test cases                            |
-| `data/eval_results.jsonl`  | Every answer from every evaluation run                     |
+| Path                       | Purpose                                                        |
+| -------------------------- | -------------------------------------------------------------- |
+| `enrich_lead.py`           | Prompt versions, the Gemini call, checks, flags, routing, HubSpot writes, run log |
+| `process_sheet.py`         | Reads new rows from the form's responses sheet                 |
+| `capture_corrections.py`   | Turns reviewed deals into correction records                   |
+| `examples.py`              | Finds and formats similar past reviews                         |
+| `evaluate.py`              | Test set scoring, the comparison report, the gate and rollback |
+| `LABELLING.md`             | The rules behind every correction and test label               |
+| `submissions/train/`       | 20 deliberately messy submissions used for the first reviews   |
+| `data/runs.jsonl`          | Every pipeline run                                             |
+| `data/corrections.jsonl`   | The candidate example pool: every reviewed deal                |
+| `data/pools/`              | Frozen copies of pools that have passed the gate               |
+| `data/live.json`           | The version and pool the pipeline runs                         |
+| `data/promotions.jsonl`    | Every promotion and rollback                                   |
+| `data/test_set.json`       | Test set 1: 10 single-category cases                           |
+| `data/test_set_2.json`     | Test set 2: 18 mixed and ambiguous cases                       |
+| `data/eval_results.jsonl`  | Every answer from every evaluation run                         |
 
-## Limitations and next steps
+## Where it stands, and what I'd do next
 
-- The test set is small and I've now looked at it several times. A new set of
-  20 to 30 cases would show whether v4 really holds up.
-- I haven't yet tested the gate against deliberately bad corrections. The plan
-  is to add a few wrong ones to a copy of the example pool and check that
-  accuracy drops and the gate rejects it.
-- TF-IDF only matches words, so it can't tell that "Black Friday" and
-  "Christmas" are related. Embeddings would, and a minimum similarity score
-  would stop it padding the prompt with examples that aren't really similar.
-- Every deal still goes to review. Routing only the doubtful ones there needs a
-  signal that predicts mistakes better than the current flags (see above).
-- My labelling rules were written for a made-up catalogue with five broad
-  categories. A real distributor knows its whole product range, with categories
-  and subcategories, which products belong where and what its usual lead times
-  are. Putting that into LABELLING.md, and from there into the prompt, would
-  remove most of the guesswork I had with things like hair dryers, kettles or
-  yoga blocks.
-- A few category rules, like kitchen appliances counting as Home, only exist in
-  the test labels so far. They belong in LABELLING.md, and in the prompt once
-  there's a fresh test set to measure them on.
-- Failed runs aren't logged, so when Gemini returns broken JSON its reply is
-  lost. Those are the runs I'd most like to look at.
-- There are no automated tests yet. The checks and the comparison logic are
-  plain functions and would be easy to cover.
-- One submission at a time is fine at this volume, but HubSpot's batch
-  endpoints would cut the number of API calls a lot.
+The live pipeline still runs v5. v7 is the strongest version on test set 2,
+and it got the first 4 cases of test set 1 right before I ran out of requests
+for the day. The gate won't promote it until it has been scored on all 10, so
+that final check, two commands, is the last thing between v7 and live deals.
+I'd rather leave it there than skip my own gate.
+
+Beyond that:
+
+- Bigger, fresher test sets. Both sets are small, so one case moves a score
+  by 5 to 10 points, and v7's changes were shaped by looking at v6's results
+  on test set 2. A new set of 30 or more cases would show how v7 really holds
+  up.
+- Use the business's own knowledge of its products. The known-borderline
+  list in LABELLING.md could flag products like towels every time, without
+  asking the model, and a real catalogue could go straight into the prompt.
+  Both need fresh test data to measure fairly.
+- Test the gate against deliberately bad feedback. The pool gate is in
+  place, but I haven't yet fed it a batch of wrong corrections to show it
+  rejecting them.
+- Let the spot-check rate adapt to how often spot-checks find mistakes.
+- Run on a paid tier. 20 requests a day kept every evaluation small. A paid
+  tier would allow larger test sets, and repeated runs to smooth out the
+  variation between identical requests.
+- Log failed runs in the pipeline itself, so a broken reply from Gemini can
+  be looked at later.
+- Add automated tests. The checks and comparisons are plain functions, and
+  I tested them by hand throughout, but they deserve a proper test suite.
 
 ## Background
 
-The first version was a Zapier flow connecting Google Forms, Gemini and HubSpot.
-I rewrote it in Python to drop the paid Zapier steps and to make the error
-handling visible, then built the review and evaluation loop on top of it.
+The first version was a no-code Zapier flow connecting Google Forms, Gemini and
+HubSpot. I rewrote it in Python to drop the paid Zapier steps and make the
+error handling visible, and then spent the second half of the project on the
+part I found most interesting: making it notice its own doubts, learn from the
+people correcting it, and prove each improvement before trusting it.
