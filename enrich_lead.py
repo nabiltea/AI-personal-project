@@ -84,6 +84,9 @@ SPOT_CHECK_RATE = 0.2
 #   v6  v3 + v4's examples, but the order is broken into products: each gets
 #       a category and its own ambiguity check, and the deal gets every
 #       category in the order (no "main" category any more)
+#   v7  v6, naming General as a second category only when genuinely unsure,
+#       "no rush" / "no fixed deadline" counting as urgency 1, and a check
+#       for vague timing ("next month") that could fit another urgency tier
 
 PROJECT_DIR = Path(__file__).resolve().parent
 RUN_LOG = PROJECT_DIR / "data" / "runs.jsonl"
@@ -95,27 +98,6 @@ CORRECTIONS_FILE = RUN_LOG.parent / "corrections.jsonl"
 # pool it was tested with. Written only by `evaluate.py --gate ... --promote`.
 LIVE_FILE = RUN_LOG.parent / "live.json"
 POOLS_DIR = RUN_LOG.parent / "pools"
-
-# What each prompt version is made of. evaluate.py scores these modes; the live
-# pipeline runs the one named in LIVE_FILE.
-PromptMode = namedtuple(
-    "PromptMode",
-    [
-        "version",          # recorded on every run and deal
-        "tell_date",        # include the received date and the urgency rules
-        "example_fields",   # fields past reviews show in the prompt; None = no examples
-        "ask_alternative",  # v5: ask whether the order could be another category
-        "per_product",      # v6: one category and ambiguity check per product
-    ],
-)
-PROMPT_MODES = {
-    "baseline":          PromptMode("v1", False, None,         False, False),
-    "fewshot":           PromptMode("v2", False, ALL_FIELDS,   False, False),
-    "rules":             PromptMode("v3", True,  None,         False, False),
-    "rules-fewshot":     PromptMode("v4", True,  ("urgency",), False, False),
-    "rules-fewshot-alt": PromptMode("v5", True,  ("urgency",), True,  False),
-    "per-product":       PromptMode("v6", True,  ("urgency",), False, True),
-}
 
 CATEGORIES = ["Cosmetics", "Electronics", "General", "Fashion", "Home"]
 
@@ -246,6 +228,70 @@ assert V3_CATEGORY_LINE in PROMPT_TEMPLATE_V3
 PROMPT_TEMPLATE_V6 = PROMPT_TEMPLATE_V3.replace(V3_CATEGORY_LINE, V6_PRODUCTS_LINE)
 
 
+# v7: three changes to v6, all from reviewing v6's results.
+# - v6 named "General" as a possible second category for nearly every product
+#   (any product could loosely be General), which sent most deals to review.
+#   v7 asks for General only when the model genuinely can't place a product,
+#   so real doubts like towels (Home, Fashion or General?) can still be raised.
+# - "No rush" or "no fixed deadline" means urgency 1, as in LABELLING.md;
+#   v6's rules only covered "no deadline mentioned" (urgency 2).
+# - Vague timing ("for a corporate event next month") gets its own check, the
+#   same way as categories: could another urgency tier also be right? The
+#   wording rules out the obvious cases, or every request would be flagged.
+V6_URGENCY_ONE = '- 1: needed more than a month away (e.g. "next quarter", "for next season")\n'
+V7_URGENCY_ONE = (
+    '- 1: needed more than a month away (e.g. "next quarter", "for next season"),\n'
+    "  or the buyer says there is no rush or no fixed deadline\n"
+)
+V6_OTHER_END = 'reasonably belong to, or none"}}'
+V7_OTHER_END = (
+    "reasonably belong to, or none. Any product could loosely count as General, "
+    "so only name General if you genuinely can't tell which specific category "
+    'it belongs to"}}'
+)
+V6_URGENCY_FIELD = (
+    '  "urgency": "Assign an urgency tier of exactly 1, 2, or 3 following the rules above",\n'
+)
+V7_URGENCY_FIELDS = V6_URGENCY_FIELD + (
+    '  "other_urgency": "If the timing is vague enough that another tier could also '
+    "be right (for example 'next month' with no date, or 'for the summer'), name "
+    "that tier. Otherwise write none. A clear deadline is not vague, and neither "
+    "is no deadline at all (tier 2) or a buyer saying there is no rush (tier 1)\",\n"
+)
+assert PROMPT_TEMPLATE_V6.count(V6_URGENCY_ONE) == 1
+assert PROMPT_TEMPLATE_V6.count(V6_OTHER_END) == 1
+assert PROMPT_TEMPLATE_V6.count(V6_URGENCY_FIELD) == 1
+PROMPT_TEMPLATE_V7 = (
+    PROMPT_TEMPLATE_V6.replace(V6_URGENCY_ONE, V7_URGENCY_ONE)
+    .replace(V6_OTHER_END, V7_OTHER_END)
+    .replace(V6_URGENCY_FIELD, V7_URGENCY_FIELDS)
+)
+
+# What each prompt version is made of. evaluate.py scores these modes; the live
+# pipeline runs the one named in LIVE_FILE.
+PromptMode = namedtuple(
+    "PromptMode",
+    [
+        "version",          # recorded on every run and deal
+        "template",         # the prompt text for this version
+        "tell_date",        # fill in the received date (v3 onwards)
+        "example_fields",   # fields past reviews show in the prompt; None = no examples
+        "ask_alternative",  # v5: ask whether the order could be another category
+        "per_product",      # v6 on: one category and ambiguity check per product
+        "ask_urgency_doubt",  # v7: ask whether another urgency tier could also fit
+    ],
+)
+PROMPT_MODES = {
+    "baseline":            PromptMode("v1", PROMPT_TEMPLATE,    False, None,         False, False, False),
+    "fewshot":             PromptMode("v2", PROMPT_TEMPLATE,    False, ALL_FIELDS,   False, False, False),
+    "rules":               PromptMode("v3", PROMPT_TEMPLATE_V3, True,  None,         False, False, False),
+    "rules-fewshot":       PromptMode("v4", PROMPT_TEMPLATE_V3, True,  ("urgency",), False, False, False),
+    "rules-fewshot-alt":   PromptMode("v5", PROMPT_TEMPLATE_V3, True,  ("urgency",), True,  False, False),
+    "per-product":         PromptMode("v6", PROMPT_TEMPLATE_V6, True,  ("urgency",), False, True,  False),
+    "per-product-careful": PromptMode("v7", PROMPT_TEMPLATE_V7, True,  ("urgency",), False, True,  True),
+}
+
+
 def build_prompt(
     product_request: str,
     mode: PromptMode = PROMPT_MODES["baseline"],
@@ -259,13 +305,7 @@ def build_prompt(
     request. Earlier versions produce exactly the prompts they always did, so
     their results stay comparable.
     """
-    if mode.per_product:
-        template = PROMPT_TEMPLATE_V6
-    elif mode.tell_date:
-        template = PROMPT_TEMPLATE_V3
-    else:
-        template = PROMPT_TEMPLATE
-    prompt = template.format(
+    prompt = mode.template.format(
         product_request=product_request,
         categories="[" + ", ".join(CATEGORIES) + "]",
         received=received,
@@ -338,6 +378,14 @@ def validate_enrichment(
     if len(product_request.split()) < SHORT_REQUEST_WORDS:
         flags.append("short_request")
 
+    other_urgency = None
+    if mode.ask_urgency_doubt:
+        doubt = re.search(r"[123]", str(data.get("other_urgency", "")))
+        # "none", or the same tier again, means the timing is clear.
+        if doubt and doubt.group(0) != urgency:
+            other_urgency = doubt.group(0)
+            flags.append(f"ambiguous_urgency:{urgency} or {other_urgency}")
+
     other_category = None
     if mode.ask_alternative:
         other_category = match_category(data.get("other_category", ""))
@@ -353,6 +401,7 @@ def validate_enrichment(
         "categories": categories,
         "products": products,
         "other_category": other_category,
+        "other_urgency": other_urgency,
         "flags": flags,
     }
 
@@ -688,6 +737,7 @@ def log_run(
             "categories": enrichment["categories"],
             # v6 only: each product with its category and possible alternative.
             "products": enrichment.get("products"),
+            "other_urgency": enrichment.get("other_urgency"),
             "other_category": enrichment.get("other_category"),
         },
         "flags": enrichment["flags"],

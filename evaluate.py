@@ -30,6 +30,8 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import requests
+
 from capture_corrections import SCORED_FIELDS, answers_match, output_categories
 from enrich_lead import (
     CATEGORIES,
@@ -178,6 +180,14 @@ def score(mode: str, pool_path: Path, test_set: Path, dry_run: bool) -> None:
             # Nothing is saved for this case, so the next run picks it up.
             print(f"\n{stop} Run the same command again after the reset.")
             break
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as failure:
+            # Google being down says nothing about the prompt, so it must not
+            # count as a wrong answer. Nothing is saved; the next run retries.
+            status = getattr(failure.response, "status_code", None)
+            if isinstance(failure, requests.HTTPError) and (status or 0) < 500:
+                raise  # a 4xx means the request itself is wrong: stop and fix it
+            print(f"{case['id']}: not scored, Gemini unreachable ({status or 'network'}); will retry next run")
+            continue
         except Exception as failure:
             # A broken answer counts as wrong: in production it would be.
             predicted = {f: None for f in SCORED_FIELDS}
