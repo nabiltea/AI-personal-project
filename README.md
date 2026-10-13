@@ -99,7 +99,10 @@ At any point you can say which prompt and which corrections were live, and why.
 
 The gate's rule is simple: a candidate is promoted if it gets at least as many
 test cases fully right as the live version. On a tie it also has to be at
-least as good at flagging the cases that should be reviewed.
+least as good at flagging the cases that should be reviewed. The gate informs
+the decision rather than making it alone: a person can promote a version it
+rejected, but only with a written reason, which is stored with the promotion.
+That has happened once, for v7, and the reasoning is below.
 
 ## How I tested it
 
@@ -118,7 +121,8 @@ from. The model had the category right on all 19 but the urgency right on only
 I then labelled two test sets by hand and kept them away from the examples the
 model sees:
 
-- Test set 1, 10 single-category requests, used to compare v1 to v5
+- Test set 1, 10 single-category requests, used to compare v1 to v5 and
+  later to check that v7 hadn't got worse at simple orders
 - Test set 2, 18 harder requests with mixed orders and ambiguous products,
   each also labelled with whether a person should review it
 
@@ -133,16 +137,17 @@ Test set 1:
 | v3 | v1 plus the date and the written urgency rules | 8/10 | 10/10 | 8/10 |
 | v4 | v3 plus past reviews, showing only their urgency | 9/10 | 10/10 | 9/10 |
 | v5 | v4 plus "could this be another category?" | 10/10 | 10/10 | 10/10 |
+| v7 | the current version (see test set 2) | 9/10 | 10/10 | 9/10 |
 
 Test set 2:
 
-| Version | What changed | Categories | Urgency | Fully right | Sent to review | Mistakes flagged |
-| --- | --- | --- | --- | --- | --- | --- |
-| v6 | orders split into products, each with its own category and ambiguity check | 12/13 | 12/13 | 11/13 | 77% | 1 of 2 |
-| v7 | General only as a genuine doubt, "no rush" means urgency 1, a check for vague timing | 18/18 | 16/18 | 16/18 | 39% | 2 of 2 |
+| Version | What changed | Categories | Urgency | Fully right | Sent to review | Review cases flagged | Mistakes flagged |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| v6 | orders split into products, each with its own category and ambiguity check | 17/18 | 16/18 | 15/18 | 83% | 8 of 8 | 2 of 3 |
+| v7 | General only as a genuine doubt, "no rush" means urgency 1, a check for vague timing | 18/18 | 16/18 | 16/18 | 39% | 5 of 8 | 2 of 2 |
 
-v6 was only scored on 13 of the 18 cases. The free Gemini tier allows 20
-requests a day, and an outage on Google's side took out part of that day's run.
+"Review cases flagged" counts the cases I'd labelled as needing a person, and
+how many of them the flags caught.
 
 ### What the results taught me
 
@@ -162,21 +167,45 @@ exactly what it's there for.
 
 A catch-all category creates noise. v6 suggested "General" as a possible
 second category for most products, because technically anything could be
-General. That sent 77% of deals to review. v7 asks for General only when the
+General. That sent 83% of deals to review. v7 asks for General only when the
 model genuinely can't place a product, and review load dropped to 39%.
 
-Flagging is a trade-off between workload and caution. v6 caught every case I
-wanted reviewed but buried them in false alarms. v7 caught both of its own
-mistakes and 5 of the 8 cases I'd marked for review, at half the workload. The
-three it missed (towels twice, and candles with reed diffusers) were all put in
-the right category, so nothing went wrong, but the doubt wasn't raised. Where
-exactly to draw that line is a business decision, which is why
-[LABELLING.md](LABELLING.md) keeps a list of known borderline products.
+Flagging is a trade-off between workload and caution. v6 flagged all 8 cases I
+wanted reviewed, but it did so by flagging almost everything, and it still let
+one of its own mistakes through unflagged ("no fixed deadline" read as standard
+urgency). v7 flagged both of its mistakes and 5 of the 8 cases I'd marked for
+review, at less than half the workload. The three it missed (towels twice, and
+candles with reed diffusers) were all put in the right category, so nothing
+went wrong, but the doubt wasn't raised. Where exactly to draw that line is a
+business decision, which is why [LABELLING.md](LABELLING.md) keeps a list of
+known borderline products.
 
 The same request doesn't always get the same answer. Even at temperature 0,
 `gemini-2.5-flash` classified one mixed order as Fashion on one run and
 Cosmetics on the next. Both runs flagged it, so it reached review either way,
 but it's a reminder that one good run doesn't prove a version is reliable.
+
+### Promoting v7 against the gate
+
+On test set 1, v7 scored 9/10 against v5's 10/10, so the gate said REJECT.
+The one miss was "We want 25 yoga blocks": five words, a product that sits
+between categories, and a right answer that depends on my rule that sports
+equipment counts as General, which no version was ever told. That request has
+changed category in almost every version (General, Fashion, Home, General,
+General, Home). v7 also flagged it, so in real use it would have gone to a
+reviewer rather than to a customer.
+
+On the other side, v5 can only give an order one category, so it can't
+represent mixed orders at all, while v7 got all 18 categories right on test
+set 2 and flagged both of its mistakes. I promoted v7 and recorded that
+reasoning with the promotion in `data/promotions.jsonl`.
+
+What I didn't do was change the gate's rule until v7 passed. Changing a test's
+rules after seeing the result makes the test meaningless. The episode did show
+a real gap in the rule, though: it counts every mistake the same, but a flagged
+mistake costs one review, while an unflagged one reaches a customer. Both v5
+and v7 had zero unflagged mistakes on test set 1. A future version of the gate
+should look at that number too.
 
 ## Why I think it's useful
 
@@ -195,7 +224,8 @@ are defined.
 
 Most importantly, it's built so that improving it can't quietly make it worse.
 Every change is measured on the same hand-labelled cases, compared with what's
-live, and kept or rejected on that basis, with a record of every decision.
+live, and kept or rejected on that basis, with a record of every decision,
+including the one time I overruled the result.
 
 ## Decisions along the way
 
@@ -336,8 +366,9 @@ python evaluate.py --mode per-product-careful
 python evaluate.py --mode per-product-careful --test-set data/test_set_2.json
 python evaluate.py --report --test-set data/test_set_2.json
 
-# Let the gate decide, and undo if needed
+# Let the gate decide, overrule it on record, or undo
 python evaluate.py --gate per-product-careful --promote
+python evaluate.py --gate per-product-careful --promote --override "why"
 python evaluate.py --rollback
 ```
 
@@ -367,14 +398,14 @@ day.
 
 ## Where it stands, and what I'd do next
 
-The live pipeline still runs v5. v7 is the strongest version on test set 2,
-and it got the first 4 cases of test set 1 right before I ran out of requests
-for the day. The gate won't promote it until it has been scored on all 10, so
-that final check, two commands, is the last thing between v7 and live deals.
-I'd rather leave it there than skip my own gate.
+v7 is live. It was promoted on 13 October 2026 against the gate's REJECT on
+test set 1, with the reason on record, as described above.
 
-Beyond that:
+What I'd do next:
 
+- Make the gate count what matters. A flagged mistake costs one review; an
+  unflagged one reaches a customer. Comparing unflagged mistakes alongside
+  overall accuracy would match the real cost of an error much better.
 - Bigger, fresher test sets. Both sets are small, so one case moves a score
   by 5 to 10 points, and v7's changes were shaped by looking at v6's results
   on test set 2. A new set of 30 or more cases would show how v7 really holds

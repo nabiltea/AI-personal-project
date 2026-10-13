@@ -13,6 +13,7 @@ Run:
     python evaluate.py --report                     # compare everything scored so far
     python evaluate.py --gate rules-fewshot-alt     # compare with the live version
     python evaluate.py --gate rules-fewshot-alt --promote   # ...and switch if it passes
+    python evaluate.py --gate X --promote --override "why" # switch despite a REJECT, on record
     python evaluate.py --rollback                   # undo the last promotion
 
 Add --test-set data/<file>.json to use a different test set. Modes that use
@@ -308,13 +309,24 @@ def gate(mode: str, pool_path: Path, test_set: Path, against: str = None):
     return promote, candidate, f"{right[candidate]}/{n} vs {right[current]}/{n}"
 
 
-def promote(mode: str, pool_path: Path, run: str, test_set: Path, score_text: str) -> None:
-    """Make the candidate live, freezing the exact pool it was tested with."""
+def promote(
+    mode: str, pool_path: Path, run: str, test_set: Path, score_text: str,
+    override: str = None,
+) -> None:
+    """Make the candidate live, freezing the exact pool it was tested with.
+
+    override is the written reason when a person promotes a version the gate
+    rejected. It is kept in the live file and the promotion history, so the
+    decision and why it was made stay on record.
+    """
     live_pool = None
     if PROMPT_MODES[mode].example_fields:
         POOLS_DIR.mkdir(parents=True, exist_ok=True)
         snapshot = POOLS_DIR / f"{pool_id(pool_path)}.jsonl"
-        shutil.copyfile(pool_path, snapshot)
+        # Snapshots are named by their contents, so an existing one is already
+        # identical (and pool_path may be that very file).
+        if not snapshot.exists():
+            shutil.copyfile(pool_path, snapshot)
         live_pool = str(snapshot.relative_to(PROJECT_DIR))
 
     entry = {
@@ -325,10 +337,15 @@ def promote(mode: str, pool_path: Path, run: str, test_set: Path, score_text: st
         "test_set": test_set.name,
         "score": score_text,
     }
+    if override:
+        entry["gate"] = "REJECT"
+        entry["override"] = override
     LIVE_FILE.write_text(json.dumps(entry, indent=2) + "\n", encoding="utf-8")
     with open(PROMOTIONS, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
     print(f"Live pipeline now runs {run}.")
+    if override:
+        print(f"Promoted against the gate, reason recorded: {override}")
 
 
 def rollback() -> None:
@@ -431,6 +448,10 @@ def main() -> int:
     parser.add_argument(
         "--promote", action="store_true", help="With --gate: switch if it passes"
     )
+    parser.add_argument(
+        "--override", metavar="REASON",
+        help="With --gate --promote: promote even if the gate rejects, recording why",
+    )
     parser.add_argument("--rollback", action="store_true", help="Undo the last promotion")
     args = parser.parse_args()
 
@@ -444,9 +465,15 @@ def main() -> int:
     if args.gate:
         if args.promote and args.against:
             raise RuntimeError("--promote only works against the live version.")
+        if args.override is not None and not (args.promote and args.override.strip()):
+            raise RuntimeError("--override needs --promote and a written reason.")
         passed, run, score_text = gate(args.gate, args.pool, args.test_set, args.against)
-        if passed and args.promote:
-            promote(args.gate, args.pool, run, args.test_set, score_text)
+        # score_text is None when the candidate is already live.
+        if args.promote and score_text and (passed or args.override):
+            promote(
+                args.gate, args.pool, run, args.test_set, score_text,
+                override=None if passed else args.override.strip(),
+            )
         # Exit code 0 = promote, 1 = reject, so scripts can act on it.
         return 0 if passed else 1
     if not (args.mode or args.report):
