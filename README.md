@@ -1,4 +1,4 @@
-# Inbound Lead Triage Pipeline
+# Self-Improving AI Order Assistant
 
 Wholesale buyers describe what they want in their own words: "We're kitting out
 a staff flat, 10 bedsheet sets, 10 towels and 4 smartphones, within two weeks."
@@ -209,7 +209,7 @@ should look at that number too.
 
 ## Why I think it's useful
 
-A distributor using this gets triaged, structured deals instead of a pile of
+A distributor using this gets sorted, structured deals instead of a pile of
 emails, and their reps only need to look closely at the deals the system isn't
 sure about. On the latest test set that was fewer than half, and every mistake
 was among them. The reps don't have to fill in anything extra: correcting the
@@ -375,6 +375,32 @@ python evaluate.py --rollback
 `--dry-run` on `enrich_lead.py` and `evaluate.py` prints the prompts without
 calling Gemini, which helps when you're down to your last few requests of the
 day.
+
+### Running it automatically
+
+Right now I run `process_sheet.py` by hand. Google Forms adds each submission
+to the responses sheet on its own, but nothing tells the script that a new row
+has arrived, so it processes whatever is waiting whenever it's run. That's fine
+for a side project. A business would want it running unattended, and there are
+three ways I'd consider:
+
+- A schedule on one machine. A cron job (or launchd on a Mac) runs
+  `python process_sheet.py` every ten minutes. It's the quickest to set up,
+  costs nothing and keeps the keys on that machine, but it only runs while the
+  machine is on.
+- A scheduled job in the cloud. GitHub Actions can run the same command every
+  15 minutes or so, with the keys stored as secrets. It doesn't depend on
+  anyone's laptop, but once the run log and corrections hold real customer
+  data they'd need to live somewhere other than a public repo.
+- A trigger on each submission. A few lines of Google Apps Script on the form
+  can call the pipeline the moment someone submits, with the pipeline running
+  as a small web service. This is what I'd do in production: deals appear
+  within seconds and nothing keeps checking an empty sheet.
+
+All three are safe to run as often as you like. Rows that already have a deal
+id in the Processed column are skipped, so nothing is created twice, and a row
+that fails (during a Gemini outage, say) is picked up again on the next run. A
+run that finds no new responses makes no Gemini requests at all.
 
 ### What's in the repo
 
